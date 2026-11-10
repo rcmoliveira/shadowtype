@@ -1,0 +1,44 @@
+# One-off local-test build: produces dist/Shadowtype.app (release, ad-hoc signed) and
+# uploads it as a downloadable artifact. Manual trigger only — never fires on push/PR,
+# so it cannot slow or gate the real CI. Ad-hoc signature means Gatekeeper blocks a
+# browser download; fetch with `gh run download` (no quarantine xattr) and it opens clean.
+name: Test build (artifact)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: Release .app artifact
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore llama.cpp prefix
+        uses: actions/cache@v6
+        with:
+          path: vendor/llama
+          key: llama-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-llama.sh') }}
+
+      - name: Build pinned llama.cpp
+        run: ./scripts/build-llama.sh
+
+      - name: Assemble release .app
+        run: ./scripts/make-app.sh
+
+      - name: Zip and checksum
+        run: |
+          cd dist
+          ditto -c -k --keepParent Shadowtype.app Shadowtype-testbuild.zip
+          shasum -a 256 Shadowtype-testbuild.zip | tee SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shadowtype-testbuild
+          path: dist/Shadowtype-testbuild.zip
+          if-no-files-found: error
