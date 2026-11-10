@@ -205,7 +205,25 @@ final class CompletionCoordinator {
     // Settings-adjustable (General → "Suggestion trigger delay"). AppDelegate.syncToggles mirrors the
     // @AppStorage value here on launch + every change; clamped to the slider's 40–400 ms range there.
     var debounce: TimeInterval = 0.120                // ~120 ms idle before triggering — the adaptive FLOOR
-    private let deadline: TimeInterval = 0.400        // drop silently if no first token by here
+    // (The FR-CE-7 first-token deadline lives in `generationDeadline(promptBytes:)` below — it used to
+    //  be a flat `private let deadline: TimeInterval = 0.400`, now the base of the size-scaled value.)
+
+    // FR-CE-7 deadline, scaled by the work this fire actually has to do. The flat 400 ms assumed the
+    // warm KV-reuse path (~65 ms prefill of appended tokens). It holds there and stays byte-identical:
+    // prompts up to 1500 bytes keep exactly 400 ms. But the FIRST fire after a focus change, after an
+    // idle reload, or after KV divergence pays a full cold prefill — and at the 2048-token context
+    // default a long email thread (~7 KB prompt) cold-prefills in ~0.5-0.9 s on M3/M4-class Macs,
+    // so the flat deadline dropped exactly those ghosts (the engine's own comment: "the deadline-drop
+    // hides the cold-prefill cost"). Extending only when the first token is genuinely late is safe:
+    // newest-wins already supersedes the run the moment the user types again, so a slow-but-arriving
+    // ghost lands only while the user is still paused — where it is useful, not a surprise.
+    // +100 ms per 1.5 KB beyond 1.5 KB, capped at 800 ms total: prefill slower than ~18 tok/100 ms
+    // at the full budget (older Airs) still drops, as before.
+    static func generationDeadline(promptBytes: Int) -> TimeInterval {
+        let base: TimeInterval = 0.400
+        let extra = Double(max(0, promptBytes - 1500)) / 15_000.0
+        return min(base + extra, 0.8)
+    }
 
     // Adaptive typing-pause trigger (research: waiting for a *natural* pause raises acceptance and
     // near-eliminates sub-0.3 s "blind rejections" vs a fixed delay — arXiv 2511.18842). The fixed
@@ -986,7 +1004,8 @@ final class CompletionCoordinator {
                 self.clearSuggestion()
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + deadline, execute: deadlineWork)
+        let scaledDeadline = Self.generationDeadline(promptBytes: prefix.utf8.count)
+        DispatchQueue.main.asyncAfter(deadline: .now() + scaledDeadline, execute: deadlineWork)
 
         // Tier 2a (mid-word healing): when the caret sits mid-word, back the prompt up to the last clean
         // word boundary and require the model to reproduce the typed stem before its output becomes the

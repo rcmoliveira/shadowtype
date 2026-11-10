@@ -211,4 +211,26 @@ final class CoordinatorSafetyTests: XCTestCase {
             capturedBundleId: "com.example.Editor",
             currentBundleId: "com.example.Editor"))
     }
+
+    // MARK: - generationDeadline (FR-CE-7 size-scaled first-token deadline)
+
+    func testGenerationDeadlineFlatAtFourHundredMsUpTo1500Bytes() {
+        // The common short-prefix case must stay byte-identical to the old flat 400 ms.
+        XCTAssertEqual(CompletionCoordinator.generationDeadline(promptBytes: 0), 0.4)
+        XCTAssertEqual(CompletionCoordinator.generationDeadline(promptBytes: 1500), 0.4)
+    }
+
+    func testGenerationDeadlineScalesMonotonicallyPastTheKnee() {
+        let a = CompletionCoordinator.generationDeadline(promptBytes: 3000)   // 0.4 + 1500/15000 = 0.5
+        let b = CompletionCoordinator.generationDeadline(promptBytes: 4500)   // 0.6
+        XCTAssertEqual(a, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(b, 0.6, accuracy: 0.0001)
+        XCTAssertLessThan(a, b)
+    }
+
+    func testGenerationDeadlineCapsAtEightHundredMs() {
+        // A full 2048-token-budget prompt (~7.1 KB) lands just under the cap; absurd inputs clamp.
+        XCTAssertEqual(CompletionCoordinator.generationDeadline(promptBytes: 7104), 0.7736, accuracy: 0.0001)
+        XCTAssertEqual(CompletionCoordinator.generationDeadline(promptBytes: 100_000), 0.8)
+    }
 }
