@@ -4,15 +4,15 @@ import XCTest
 
 final class SamplingParamsTests: XCTestCase {
 
-    // The ghost-text default must reproduce the pre-M0 hardcoded sampler chain BYTE-FOR-BYTE so
-    // existing ghost behaviour is unchanged. If you intentionally tune ghost sampling, update both
-    // this test AND the documented chain in InferenceEngine in the same commit.
+    // Ghost-text defaults are pinned deliberately (see the ghostDefaults comment for the tuning
+    // rationale). If you intentionally re-tune ghost sampling, update this test AND the documented
+    // chain in InferenceEngine in the same commit.
     func testGhostDefaultsMatchPreM0Chain() {
         let g = SamplingParams.ghostDefaults
-        XCTAssertEqual(g.temperature, 0.4)
+        XCTAssertEqual(g.temperature, 0.2)
         XCTAssertEqual(g.topP, 0.9)
         XCTAssertEqual(g.topK, 40)
-        XCTAssertEqual(g.repeatPenalty, 1.1)
+        XCTAssertEqual(g.repeatPenalty, 1.05)
         XCTAssertEqual(g.repeatPenaltyLastN, 64)
         XCTAssertEqual(g.seed, 0xACE1)
         XCTAssertFalse(g.greedy)

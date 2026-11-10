@@ -1,7 +1,7 @@
 // SamplingParams — per-request sampler configuration. Threaded through the engine so the existing
 // ghost-text path and the upcoming /v1 API path can coexist with different sampling behavior in the
-// same llama context. Ghost passes `.ghostDefaults` (byte-identical to the pre-M0 hardcoded chain);
-// API/MCP build params from the request body via `apiClamped(...)`.
+// same llama context. Ghost passes `.ghostDefaults` (retuned for ghost-text quality — see the
+// ghostDefaults comment); API/MCP build params from the request body via `apiClamped(...)`.
 //
 // `useEngineStopPolicy` is the early-branch flag inside `InferenceEngine.generate`:
 //   - true  (ghost): keep word-buffering, sentence detection, leading-newline strip, maxWords cap.
@@ -41,11 +41,21 @@ struct SamplingParams: Sendable, Equatable {
     // in the model's FIM tokens. Engine rejects non-nil when the loaded model lacks FIM tokens.
     var fim: FIMRequest?
 
+    // Ghost-text defaults. Retuned from the original temp 0.4 / repeat-penalty 1.1 chain:
+    //   - temperature 0.4 → 0.2: a 2–4 word ghost should be the model's *most likely*
+    //     continuation, not a dice roll. 0.4 sampled tokens that disagreed with the confidence
+    //     gate (which scores raw top-1), so the gate let through ghosts the sampler then
+    //     rendered differently. Low temp makes suggestion-vs-gate agree and ghosts stable
+    //     across keystrokes (the fixed seed keeps identical prompts identical, but only helps
+    //     when the distribution is peaked enough to sample near-deterministically).
+    //   - repeatPenalty 1.1 → 1.05: at 2–4-token output with lastN 64, a 1.1 penalty
+    //     suppresses exactly the articles/pronouns a short completion legitimately repeats
+    //     ("the … the", "I'll … I'll"), pushing output toward ungrammatical alternatives.
     static let ghostDefaults = SamplingParams(
-        temperature: 0.4,
+        temperature: 0.2,
         topP: 0.9,
         topK: 40,
-        repeatPenalty: 1.1,
+        repeatPenalty: 1.05,
         repeatPenaltyLastN: 64,
         seed: 0xACE1,
         greedy: false,
