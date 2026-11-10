@@ -1379,6 +1379,10 @@ final class EditContextTracker {
         return s
     }
 
+    // Throttle for the global-secure-input diagnostic below (main-thread only, like all of
+    // EditContextTracker's state).
+    private var lastGlobalSecureInputLog: Date?
+
     private func isSecure(_ element: AXUIElement) -> Bool {
         // FR-KC-4: never read or suggest in secure fields. The SDK exposes the secure text field
         // via the AX *subrole* (kAXSecureTextFieldSubrole == "AXSecureTextField"), plus the global
@@ -1388,7 +1392,21 @@ final class EditContextTracker {
            let subrole = sub as? String, subrole == (kAXSecureTextFieldSubrole as String) {
             return true
         }
-        return IsSecureEventInputEnabled()
+        if IsSecureEventInputEnabled() {
+            // IsSecureEventInputEnabled() is SYSTEM-WIDE: any other process holding secure input
+            // (a parked `sudo` prompt, some password managers, DRM players) suppresses suggestions
+            // in *every* app, which users experience as "ShadowType stopped working" with zero
+            // signal. The suppression is deliberate privacy policy and stays, but the cause is
+            // logged (throttled) so diag.log explains the silence instead of hiding it.
+            if lastGlobalSecureInputLog == nil
+                || Date().timeIntervalSince(lastGlobalSecureInputLog!) > 60 {
+                lastGlobalSecureInputLog = Date()
+                Diag.log("secure-input: global secure-event-input is ON (held by another process, "
+                    + "e.g. sudo prompt or password manager) — suggestions suppressed app-wide")
+            }
+            return true
+        }
+        return false
     }
 
     // MARK: - Geometry (FR-OV-3)
