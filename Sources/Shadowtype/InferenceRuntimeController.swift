@@ -207,21 +207,35 @@ final class InferenceRuntimeController {
         }
     }
 
+    // Backoff after a failed idle reload: retry at most every 30 s of activity instead of
+    // re-attempting a heavy (1+ GB) load on every keystroke while the failure persists.
+    private var lastIdleReloadFailureAt: Date?
+    private static let idleReloadRetryBackoff: TimeInterval = 30
+
     func noteActivityAndReloadIfNeeded() {
         lastInputAt = Date()
         guard modelIdleUnloaded,
               !modelReloadInFlight,
               let url = currentModelURL else { return }
+        if let failedAt = lastIdleReloadFailureAt,
+           Date().timeIntervalSince(failedAt) < Self.idleReloadRetryBackoff { return }
         modelIdleUnloaded = false
         modelReloadInFlight = true
         coordinator.reloadModel(at: url.path, fallbackPath: nil) { [weak self] ok, _ in
             guard let self else { return }
             self.modelReloadInFlight = false
             if ok {
+                self.lastIdleReloadFailureAt = nil
                 self.statusItem.setModelName(url.deletingPathExtension().lastPathComponent)
             } else {
+                // Keep the idle-unloaded state true so a TRANSIENT load failure (memory pressure,
+                // Metal hiccup after wake) is retried on later activity instead of silently
+                // killing every completion until relaunch. Throttled by idleReloadRetryBackoff.
+                self.modelIdleUnloaded = true
+                self.lastIdleReloadFailureAt = Date()
+                self.statusItem.setModelName("idle — model reload failed, retrying")
                 NSLog(
-                    "Shadowtype: idle reload of \(url.lastPathComponent) failed; model stays unloaded until the next model swap or relaunch")
+                    "Shadowtype: idle reload of \(url.lastPathComponent) failed; will retry within \(Int(Self.idleReloadRetryBackoff))s of further activity")
             }
         }
     }
