@@ -2331,12 +2331,14 @@ final class CompletionCoordinator {
     // engine's live token cap by AppDelegate.syncToggles, right next to where it sets
     // `engine.maxContextTokens` — THE TWO MUST STAY IN SYNC. They used to drift: this was hardcoded to
     // 6000 ("well inside the engine's 4096-token window"), but the window is the USER's
-    // `shadowtype.contextWindowTokens` setting, 1024 by default. InferenceEngine.generate() front-trims
+    // `shadowtype.contextWindowTokens` setting, 2048 by default. InferenceEngine.generate() front-trims
     // the tokenized prompt to that cap, and the FRONT is exactly where `Context:\n` + instruction +
     // style + clipboard + OCR live — so every context block we paid to build was decapitated and the
     // model got a headless fragment glued to `\n\nText:\n`, the flat-document shape the framing below
-    // exists to avoid. This default mirrors the 1024-token default of that key.
-    var promptCharBudget = CompletionCoordinator.promptBudgetBytes(forContextTokens: 1024)
+    // exists to avoid. This default mirrors the 2048-token default of that key (raised from 1024: the
+    // 3.5 KB prompt budget front-trimmed long drafts before the context blocks could matter; 2048
+    // doubles the recent-text window, matching how the strongest ghost-text competitors read the thread).
+    var promptCharBudget = CompletionCoordinator.promptBudgetBytes(forContextTokens: 2048)
 
     // Pure (testable): prompt bytes that safely fit `tokens` tokens. 3.5 bytes/token is deliberately
     // BELOW the ~4 bytes/token of mixed English prose: under-filling only wastes a little of the window,

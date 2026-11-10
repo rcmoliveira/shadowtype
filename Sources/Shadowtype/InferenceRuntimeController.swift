@@ -120,7 +120,7 @@ final class InferenceRuntimeController {
     static func configuredSettings(defaults: UserDefaults = .standard) -> PowerPolicy.Settings {
         let delayMs = defaults.object(forKey: "shadowtype.triggerDelayMs") as? Double ?? 50
         let contextTokens =
-            (defaults.object(forKey: "shadowtype.contextWindowTokens") as? Int) ?? 1024
+            (defaults.object(forKey: "shadowtype.contextWindowTokens") as? Int) ?? 2048
         return PowerPolicy.Settings(
             debounce: max(0.04, min(0.4, delayMs / 1000)),
             maxTokens: CompletionLength.current(defaults: defaults).maxTokens,

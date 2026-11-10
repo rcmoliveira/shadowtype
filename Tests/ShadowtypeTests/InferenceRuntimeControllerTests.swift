@@ -23,7 +23,7 @@ final class InferenceRuntimeControllerTests: XCTestCase {
 
         XCTAssertEqual(
             settings,
-            PowerPolicy.Settings(debounce: 0.05, maxTokens: 16, maxContextTokens: 1024))
+            PowerPolicy.Settings(debounce: 0.05, maxTokens: 16, maxContextTokens: 2048))
     }
 
     func testConfiguredSettingsMapsLengthAndClampsDelay() {

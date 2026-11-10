@@ -873,7 +873,7 @@ private struct ContextPane: View {
     @AppStorage("clipboardContextEnabled") private var clipboardContext = false
     // Live: AppDelegate.syncToggles caps engine.maxContextTokens from this key AND derives the
     // coordinator's prompt byte budget from it, so this picker sizes the context blocks too.
-    @AppStorage("shadowtype.contextWindowTokens") private var contextTokens = 1024
+    @AppStorage("shadowtype.contextWindowTokens") private var contextTokens = 2048
     private let permissionTick = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     private var effectiveScreenOCR: Binding<Bool> {
