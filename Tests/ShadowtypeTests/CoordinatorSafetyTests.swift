@@ -234,4 +234,69 @@ final class CoordinatorSafetyTests: XCTestCase {
         XCTAssertEqual(CompletionCoordinator.generationDeadline(promptBytes: 7104), 0.7736, accuracy: 0.0001)
         XCTAssertEqual(CompletionCoordinator.generationDeadline(promptBytes: 100_000), 0.8)
     }
+
+    // MARK: - wordCompletionWindow (mid-word word-completion prompt size)
+
+    func testWordWindowShortPrefixUnchanged() {
+        // Under the cap the prompt is byte-identical to before: no behaviour change for short drafts.
+        XCTAssertEqual(CompletionCoordinator.wordCompletionWindow("Hello wor", maxChars: 400), "Hello wor")
+    }
+
+    func testWordWindowAnchorsOnNearestSentenceEnd() {
+        // Realistic prose: sentences every ~67 chars, so the sentence being written always sits inside a
+        // 400-char window. The anchor is the sentence start, not an arbitrary slice of the document.
+        let sent = "The quarterly numbers look solid and the team shipped on schedule. "
+        let prefix = String(repeating: sent, count: 8) + "and the clients expec"
+        let w = CompletionCoordinator.wordCompletionWindow(prefix, maxChars: 400)
+        XCTAssertTrue(w.hasPrefix(" and the clients expec"), "got: \(w.prefix(60))")
+    }
+
+    func testWordWindowAnchorDoesNotMoveWhileTypingTheWord() {
+        // THE property that makes this faster rather than slower. A sliding tail window moves its start
+        // one char per keystroke → a cold re-prefill every keystroke (the #11 trap). Here the window must
+        // keep starting at the same sentence anchor as the word grows. (Compare the anchor, not the whole
+        // head: the caret-side text grows by design.)
+        let sent = "The quarterly numbers look solid and the team shipped on schedule. "
+        let base = String(repeating: sent, count: 8) + "and the clients expec"
+        for extra in ["", "t", "ts", "ts ", "ts ag", "ts agen", "ts agen "] {
+            let w = CompletionCoordinator.wordCompletionWindow(base + extra, maxChars: 400)
+            XCTAssertTrue(w.hasPrefix(" and the clients expec"),
+                          "anchor moved after \(extra.debugDescription): got \(w.prefix(40))")
+        }
+    }
+
+    func testWordWindowFallsBackToWordAlignedCutWithoutBoundary() {
+        // One long run-on sentence, no . ! ? or newline inside the window.
+        let runOn = String(repeating: "word ", count: 200) + "incomplete wor"
+        let w = CompletionCoordinator.wordCompletionWindow(runOn, maxChars: 400)
+        XCTAssertLessThanOrEqual(w.count, 400)
+        XCTAssertTrue(w.hasPrefix("word "), "cut landed mid-word: \(w.prefix(20))")
+        XCTAssertTrue(w.hasSuffix("incomplete wor"))
+    }
+
+    func testWordWindowDoesNotAnchorOnDecimals() {
+        // "3.14" has a dot but not dot-then-whitespace, so it must not become the anchor.
+        let sent = "The quarterly numbers look solid and the team shipped on schedule. "
+        let prefix = String(repeating: sent, count: 7) + "Use pi = 3.14 and now the final wor"
+        let w = CompletionCoordinator.wordCompletionWindow(prefix, maxChars: 400)
+        XCTAssertTrue(w.hasPrefix(" Use pi = 3.14 and now the final wor"), "got: \(w.prefix(60))")
+    }
+
+    // Known, accepted limitation: a dot-abbreviation ("e.g. ", "i.e. ") looks exactly like a sentence
+    // end to a whitespace check, so it wins the anchor and the window loses the few words before it.
+    // Costs a little context on rare inputs; not worth abbreviation heuristics next to a 10x prefill cut.
+    func testWordWindowAbbreviationFalseAnchorIsTolerated() {
+        let sent = "The quarterly numbers look solid and the team shipped on schedule. "
+        let prefix = String(repeating: sent, count: 7) + "Use e.g. x and now the final wor"
+        let w = CompletionCoordinator.wordCompletionWindow(prefix, maxChars: 400)
+        XCTAssertEqual(w, " x and now the final wor")
+    }
+
+    func testWordWindowPrefersNearestBoundaryIncludingNewline() {
+        let sent = "The quarterly numbers look solid and the team shipped on schedule. "
+        let prefix = String(repeating: sent, count: 7) + "line one.\nline two being typed no"
+        let w = CompletionCoordinator.wordCompletionWindow(prefix, maxChars: 400)
+        XCTAssertTrue(w.hasPrefix("line two being typed no"), "got: \(w.prefix(60))")
+    }
 }
+

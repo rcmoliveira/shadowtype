@@ -808,10 +808,9 @@ final class CompletionCoordinator {
         // "Auto-show word alternatives" (FlowIn port): on for this app AND the caret sits mid-word.
         // wordTrigger then bypasses the boundary gate (like emoji/snippet), and the mid-word Tier 2a
         // heal in startGeneration is already the stem-constrained completion the menu needs.
-        let wordAlternativesOn = appSettings.resolve(\.wordAlternatives, forBundleId: bundleId,
-                                                     globalDefault: false)
-        let wordTrigger = wordAlternativesOn && !shellOptIn
-            && (rawPrefix.flatMap { WordCompletion.stem(beforeCaret: $0) } != nil)
+        // Same predicate the prompt builder uses (see isWordCompletionFire) — gate and prompt cannot
+        // disagree about which fire is a word fire.
+        let wordTrigger = isWordCompletionFire(prefix: rawPrefix, bundleId: bundleId)
         let prefixEvaluation = CompletionActivationEvaluator.evaluatePrefix(
             .init(
                 forced: forced || taughtHere,
@@ -2426,16 +2425,82 @@ final class CompletionCoordinator {
         contextAssembler.storeTokenizerValidatedBudget(budget, for: key)
     }
 
+    /// One predicate for "this fire is a mid-word word-completion fire", shared by the activation gate
+    /// and the prompt builder so they can never disagree (a gate that fires while the prompt builder
+    /// disagrees is the classic "no ghost and no reason" bug class).
+    /// Deliberately a PURE function of the prefix rather than a flag stashed on the session: the eager
+    /// warm builds its prompt before the real fire does, and both must derive the SAME answer from their
+    /// respective prefixes or the prompt head diverges and forces a full cold re-prefill (the #11 trap).
+    /// The stem predicate is monotone within a word (it stays true as the word grows), so warm and fire
+    /// agree across a burst.
+    /// NOTE the terminal term differs from the gate's `shellOptIn` by the `!(forced || taughtHere)`
+    /// clause: a force-taught terminal therefore keeps its full prompt. Acceptable and intentional —
+    /// terminals frame their own shell prompt (`assembleShellPrompt`) and are skipped by the warm anyway.
+    private func isWordCompletionFire(prefix: String?, bundleId: String?) -> Bool {
+        guard let prefix else { return false }
+        let shellOptIn = ActivationPolicy.isManaged(bundleId: bundleId)
+            && ActivationPolicy.isTerminal(bundleId: bundleId)
+            && appSettings.resolve(\.shellCommands, forBundleId: bundleId, globalDefault: false)
+        return appSettings.resolve(\.wordAlternatives, forBundleId: bundleId, globalDefault: false)
+            && !shellOptIn
+            && WordCompletion.stem(beforeCaret: prefix) != nil
+    }
+
+    /// Window kept for a mid-word word-completion prompt: from the strongest boundary NEAREST the caret
+    /// that still fits in `maxChars`, forward to the caret.
+    /// ANCHORING is the whole design, not slicing. A fixed-size *sliding* tail window moves its start one
+    /// character per keystroke, so the prompt head changes every keystroke and the engine cold-reprefills
+    /// every keystroke (measured: 3 distinct heads across 6 keystrokes) — the exact #11 trap this file
+    /// warns about. A sentence/line terminator, by contrast, does not move while the user types inside
+    /// the sentence, so the head is byte-stable across the burst and KV reuse holds (FR-CE-5). It also
+    /// keeps the *most relevant* context: the sentence being written, not an arbitrary 400 chars.
+    static func wordCompletionWindow(_ prefix: String, maxChars: Int) -> String {
+        guard prefix.count > maxChars else { return prefix }
+        let chars = Array(prefix)
+        let n = chars.count
+        let earliest = n - maxChars        // never reach further back than the window
+        var i = n - 1
+        while i > earliest {
+            let c = chars[i]
+            if c == "\n" { return String(chars[(i + 1)...]) }
+            // A terminator counts only when followed by whitespace, so decimals ("3.14"), ellipses and
+            // abbreviations ("e.g. x") do not masquerade as sentence ends.
+            if c == "." || c == "!" || c == "?" {
+                if i + 1 < n, chars[i + 1].isWhitespace { return String(chars[(i + 1)...]) }
+            }
+            i -= 1
+        }
+        // No boundary inside the window (one long run-on sentence): fall back to a word-aligned cut.
+        // This one DOES slide per keystroke — accepted, because it only happens past `maxChars` of
+        // unbroken prose, where the prompt is already small and a clean cut beats head stability.
+        let tail = String(chars[earliest...])
+        guard let firstSpace = tail.firstIndex(where: { $0.isWhitespace }) else { return tail }
+        return String(tail[tail.index(after: firstSpace)...])
+    }
+
+    // How much prose a mid-word word-completion prompt keeps, in characters (~100 tokens → prefill in
+    // the tens of ms, versus the 400–800 ms the full context assembly costs). This number IS the
+    // latency: prefill is linear in prompt bytes, and a word completion emits one or two tokens.
+    var wordPromptWindowChars = 400
+
     private func assembledPrompt(prefix: String, postCaret: String?, totalChars: Int? = nil) -> String {
+        // Mid-word word completion needs a SHORT prompt. Prefill cost is linear in prompt bytes, and the
+        // full assembly below (instruction + style + clipboard + OCR) costs 400–800 ms of it — which is
+        // the entire reason a mid-word ghost feels slow even though it only ever emits one or two tokens.
+        // What disambiguates a word completion is the sentence nearest the caret, not a screenful of
+        // sidebar, so a word fire drops the context blocks and keeps just that sentence.
+        let wordFire = isWordCompletionFire(prefix: prefix, bundleId: context.frontmostBundleId)
+        let promptPrefix = wordFire
+            ? Self.wordCompletionWindow(prefix, maxChars: wordPromptWindowChars) : prefix
         // Resolve each (already-gated-ready) source, then hand the gating + ordering + join to the pure
         // static below so it is unit-testable without AX/model/overlay (the leak-when-unlicensed property
         // is the security-critical invariant). Style hint is the focus-in snapshot (stable across the
         // burst); OCR is read from its warm cache.
-        let instruction = instructionStore?.effectiveInstruction(bundleId: context.frontmostBundleId)
+        let instruction = wordFire ? nil : instructionStore?.effectiveInstruction(bundleId: context.frontmostBundleId)
         let styleHint = contextAssembler.cachedStyleHint
-        let clip = clipboardContextEnabled
+        let clip = (!wordFire && clipboardContextEnabled)
             ? clipboard?.recentText(maxChars: clipboardContextChars) : nil
-        let ocrRaw = contextAssembler.cachedOCR
+        let ocrRaw = wordFire ? nil : contextAssembler.cachedOCR
         // Strip the user's own draft (and any ghost the OCR captured after it) from the screen text so
         // it isn't duplicated with the prefix below — the draft is only known here, on the prompt path.
         // De-dup the user's own document (already in `prefix`) from the screen text first, then strip
@@ -2475,11 +2540,11 @@ final class CompletionCoordinator {
         let ctxLang = (useScreenOCR && ocr != nil) ? contextAssembler.ocrLanguage : nil
 
         let assembled = Self.assemblePrompt(
-            prefix: prefix,
+            prefix: promptPrefix,
             instruction: instruction,
-            styleHint: styleHint, styleEnabled: styleProfileEnabled,
-            clipboard: clip, clipboardEnabled: clipboardContextEnabled,
-            ocr: ocr, ocrEnabled: useScreenOCR,
+            styleHint: styleHint, styleEnabled: !wordFire && styleProfileEnabled,
+            clipboard: clip, clipboardEnabled: !wordFire && clipboardContextEnabled,
+            ocr: ocr, ocrEnabled: !wordFire && useScreenOCR,
             postCaret: postCaret,
             steerLanguageName: ctxLang.flatMap(Self.englishLanguageName),
             totalChars: totalChars ?? promptCharBudget)
