@@ -120,7 +120,8 @@ final class AppSettingsStoreTests: XCTestCase {
         )
         XCTAssertEqual((object["version"] as? NSNumber)?.intValue, 1)
         let apps = try XCTUnwrap(object["apps"] as? [String: Any])
-        XCTAssertNotNil(apps["com.apple.dt.Xcode"])
+        // Keys are stored normalized (lowercased) — bundle-id case-insensitivity contract (see init).
+        XCTAssertNotNil(apps["com.apple.dt.xcode"])
     }
 
     func testTolerantDecodeOfMissingFields() throws {
