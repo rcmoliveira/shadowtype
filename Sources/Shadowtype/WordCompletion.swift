@@ -83,4 +83,15 @@ enum WordCompletion {
         }
         return menu
     }
+
+    // Digit acceptance — FlowIn's confirmed accept interaction: menu rows are number-ordered and
+    // typing 1, 2, 3… inserts that branch. Returns the selected word, or nil when the digit is
+    // NOT a visible row — the caller must then let the keystroke through as ordinary typing
+    // (digits are common characters; swallowing them unconditionally would eat real input).
+    // The event-tap side of this guard mirrors TabSwallowTap: swallow only while the menu is
+    // visible AND the digit maps to a rendered row (1-based, as displayed).
+    static func select(menu: [String], digit: Int) -> String? {
+        guard digit >= 1, digit <= menu.count else { return nil }
+        return menu[digit - 1]
+    }
 }

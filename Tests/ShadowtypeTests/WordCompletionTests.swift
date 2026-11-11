@@ -93,4 +93,20 @@ final class WordCompletionTests: XCTestCase {
             candidates: [c("land", 0.5), c("Land", 0.2)], stem: "eng")
         XCTAssertEqual(menu, ["england", "engLand"])   // dedupe is case-sensitive by design
     }
+
+    // MARK: - digit acceptance (FlowIn: type 1, 2, 3… to insert that row)
+
+    func testSelectMapsDigitsToVisibleRows() {
+        let menu = ["message", "messages", "messenger"]
+        XCTAssertEqual(WordCompletion.select(menu: menu, digit: 1), "message")
+        XCTAssertEqual(WordCompletion.select(menu: menu, digit: 3), "messenger")
+    }
+
+    func testSelectRejectsOutOfRangeDigits() {
+        let menu = ["message", "messages"]
+        XCTAssertNil(WordCompletion.select(menu: menu, digit: 0))     // no row 0
+        XCTAssertNil(WordCompletion.select(menu: menu, digit: 3))     // only 2 rows visible
+        XCTAssertNil(WordCompletion.select(menu: menu, digit: 9))     // ordinary typing
+        XCTAssertNil(WordCompletion.select(menu: [], digit: 1))       // no menu shown
+    }
 }
