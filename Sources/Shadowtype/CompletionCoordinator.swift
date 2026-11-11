@@ -1083,6 +1083,11 @@ final class CompletionCoordinator {
         let wordAlternativesOn = !shellMode && requiredPrefix != nil && midWordStem != nil
             && appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId,
                                    globalDefault: false)
+        // Decision trail (issue: "alternatives list not displayed"): one line per generation,
+        // booleans only — which of the three gates is false is the whole diagnosis.
+        Diag.log("gen: wordAlt req=\(requiredPrefix != nil) stem=\(midWordStem ?? "nil") "
+               + "resolve=\(appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId, globalDefault: false)) "
+               + "on=\(wordAlternativesOn)")
         let onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? =
             wordAlternativesOn ? { branches in
                 guard let stem = midWordStem else { return }

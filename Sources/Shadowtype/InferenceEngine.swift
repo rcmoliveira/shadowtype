@@ -838,6 +838,7 @@ final class InferenceEngine: InferenceEngineProtocol {
                                                   ctx: ctx, vocab: vocab, batch: &batch,
                                                   seqID: seqID, nPast: nPast, nVocab: nVocab,
                                                   cancellationRequest: cancellationRequest)
+                Diag.log("engine: word-branch expand topK=\(topK.count) branches=\(branches.count)")
                 onWordBranches?(branches)
             }
             let hadContentBefore = sawNonSpace
