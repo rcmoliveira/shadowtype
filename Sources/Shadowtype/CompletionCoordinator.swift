@@ -1086,6 +1086,7 @@ final class CompletionCoordinator {
         // Decision trail (issue: "alternatives list not displayed"): one line per generation,
         // booleans only — which of the three gates is false is the whole diagnosis.
         Diag.log("gen: wordAlt req=\(requiredPrefix != nil) stem=\(midWordStem ?? "nil") "
+               + "bundle=\(context.frontmostBundleId ?? "nil") "
                + "resolve=\(appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId, globalDefault: false)) "
                + "on=\(wordAlternativesOn)")
         let onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? =
