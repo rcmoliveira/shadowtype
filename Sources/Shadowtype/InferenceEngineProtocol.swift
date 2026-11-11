@@ -61,7 +61,8 @@ protocol InferenceEngineProtocol: AnyObject {
                   params: SamplingParams,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)?) throws
 
     // The engine's REAL context window, as opposed to `maxContextTokens` — which is engine-WIDE but is
     // driven from the GHOST's "Context window size" setting (1024 by default). Because generate()
@@ -99,9 +100,11 @@ extension InferenceEngineProtocol {
                   contextTokenCap: Int?,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         try generate(prompt: prompt, maxTokens: maxTokens, seqID: seqID, params: params,
-                     requiredPrefix: requiredPrefix, onToken: onToken, onSample: onSample)
+                     requiredPrefix: requiredPrefix, onToken: onToken, onSample: onSample,
+                     onWordBranches: onWordBranches)
     }
 
     // Legacy ghost-text shape. Forwards to the new method with `seq 0` + `.ghostDefaults` so all
@@ -110,11 +113,13 @@ extension InferenceEngineProtocol {
     func generate(prompt: String, maxTokens: Int,
                   requiredPrefix: [UInt8]? = nil,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)? = nil) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)? = nil,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         try generate(prompt: prompt, maxTokens: maxTokens,
                      seqID: 0, params: .ghostDefaults,
                      requiredPrefix: requiredPrefix,
-                     onToken: onToken, onSample: onSample)
+                     onToken: onToken, onSample: onSample,
+                     onWordBranches: onWordBranches)
     }
 }
 
@@ -176,11 +181,13 @@ final class InferenceEngineRouter: InferenceEngineProtocol {
                   seqID: Int32, params: SamplingParams,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         try active.generate(prompt: prompt, maxTokens: maxTokens,
                             seqID: seqID, params: params,
                             requiredPrefix: requiredPrefix,
-                            onToken: onToken, onSample: onSample)
+                            onToken: onToken, onSample: onSample,
+                            onWordBranches: onWordBranches)
     }
 
     // Forwarded explicitly so the per-call cap reaches the backend that implements it; a backend that
@@ -190,11 +197,13 @@ final class InferenceEngineRouter: InferenceEngineProtocol {
                   contextTokenCap: Int?,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         try active.generate(prompt: prompt, maxTokens: maxTokens,
                             seqID: seqID, params: params,
                             contextTokenCap: contextTokenCap,
                             requiredPrefix: requiredPrefix,
-                            onToken: onToken, onSample: onSample)
+                            onToken: onToken, onSample: onSample,
+                            onWordBranches: onWordBranches)
     }
 }

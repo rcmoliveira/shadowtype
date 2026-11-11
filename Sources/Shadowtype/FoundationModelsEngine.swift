@@ -208,7 +208,8 @@ final class FoundationModelsEngine: InferenceEngineProtocol {
                   seqID: Int32, params: SamplingParams,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         guard isLoaded else { throw InferenceError.notLoaded }
         #if canImport(FoundationModels)
         if #available(macOS 26, *) {
