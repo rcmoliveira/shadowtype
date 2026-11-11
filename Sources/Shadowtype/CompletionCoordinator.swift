@@ -366,7 +366,15 @@ final class CompletionCoordinator {
         // Until we've seen a few intervals, behave exactly like the old fixed debounce.
         guard recentIKIs.count >= 3 else { return floor }
         let target = Self.median(recentIKIs) * pauseMultiplier
-        return min(adaptivePauseCeiling, max(floor, target))
+        let delay = min(adaptivePauseCeiling, max(floor, target))
+        // "Auto-show word alternatives" is a fire-WHILE-typing interaction (FlowIn's branch menu
+        // tracks the word, it does not wait for a sentence pause): with it on for the focused app,
+        // clamp the adaptive pause back to the debounce floor so the menu keeps up with typing.
+        if appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId,
+                               globalDefault: false) {
+            return floor
+        }
+        return delay
     }
 
     private static func median(_ xs: [TimeInterval]) -> TimeInterval {
@@ -703,6 +711,13 @@ final class CompletionCoordinator {
             ? context.focusedFieldAndWindowHeights() : nil
         let shellOptIn = managed && ActivationPolicy.isTerminal(bundleId: bundleId)
             && appSettings.resolve(\.shellCommands, forBundleId: bundleId, globalDefault: false)
+        // "Auto-show word alternatives" (FlowIn port): on for this app AND the caret sits mid-word.
+        // wordTrigger then bypasses the boundary gate (like emoji/snippet), and the mid-word Tier 2a
+        // heal in startGeneration is already the stem-constrained completion the menu needs.
+        let wordAlternativesOn = appSettings.resolve(\.wordAlternatives, forBundleId: bundleId,
+                                                     globalDefault: false)
+        let wordTrigger = wordAlternativesOn && !shellOptIn
+            && (rawPrefix.flatMap { WordCompletion.stem(beforeCaret: $0) } != nil)
         let prefixEvaluation = CompletionActivationEvaluator.evaluatePrefix(
             .init(
                 forced: forced,
@@ -716,7 +731,8 @@ final class CompletionCoordinator {
                 focusSeq: context.focusChangeSequence,
                 emojiTrigger: rawPrefix.map(isEmojiTrigger) ?? false,
                 minPrefixChars: minPrefixChars,
-                snippetTrigger: rawPrefix.map { isSnippetTrigger($0, bundleId: bundleId) } ?? false
+                snippetTrigger: rawPrefix.map { isSnippetTrigger($0, bundleId: bundleId) } ?? false,
+                wordTrigger: wordTrigger
             ),
             capabilityGate: capabilityGate
         )
@@ -1017,6 +1033,7 @@ final class CompletionCoordinator {
         // head also keeps the KV anchor stable while typing within a word (fewer re-prefills).
         var promptPrefix = prefix
         var requiredPrefix: [UInt8]? = nil
+        var midWordStem: String? = nil   // bare stem for the word-branch menu (no leading WS)
         // Runtime kill-switch (default ON): healing fires on most completions (mid-word is the common
         // boundary), so this is the one-flip escape hatch if a beta surfaces a regression — no rebuild
         // (`defaults write com.shadowtype.app shadowtype.midWordHealing -bool NO`).
@@ -1026,8 +1043,10 @@ final class CompletionCoordinator {
             let trimmedWS = String(split.head.dropFirst(headTrimmed.count))
             promptPrefix = headTrimmed
             requiredPrefix = Array((trimmedWS + split.stem).utf8)
+            midWordStem = split.stem
         }
         generationSession.isHealed = (requiredPrefix != nil)
+        generationSession.wordBranchMenu = nil
 
         // FR-CTX-1/2/3, FR-PA-3: assemble enabled leading context, then the user's prefix as the
         // forward-from-caret tail. With context toggles off, effectivePrompt is the
@@ -1050,6 +1069,25 @@ final class CompletionCoordinator {
         // useEngineStopPolicy=false → raw stream, no prose word/sentence caps). Same seq 0 for KV continuity.
         let genParams: SamplingParams = shellMode ? .commandDefaults : .ghostDefaults
         let genMaxTokens = shellMode ? Self.shellMaxTokens : self.maxTokens
+        // "Auto-show word alternatives": on a mid-word (stem-constrained) generation, collect the
+        // engine's top-K continuations and build the numbered menu. Arrives on the inference thread
+        // at the first content token — the menu is ready as the ghost renders, FlowIn-style.
+        let wordAlternativesOn = !shellMode && requiredPrefix != nil && midWordStem != nil
+            && appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId,
+                                   globalDefault: false)
+        let onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? =
+            wordAlternativesOn ? { branches in
+                guard let stem = midWordStem else { return }
+                let menu = WordCompletion.branchMenu(
+                    candidates: branches.map { WordCompletion.Candidate(remainder: $0.remainder,
+                                                                        probability: $0.prob) },
+                    stem: stem)
+                DispatchQueue.main.async {
+                    guard self.isCurrent(myGen) else { return }
+                    self.generationSession.wordBranchMenu = menu.isEmpty ? nil : menu
+                    Diag.log("gen: word menu rows=\(menu.count) top=\(menu.prefix(3))")
+                }
+            } : nil
 
         inferenceQueue.async { [weak self] in
             guard let self else { return }
@@ -1139,7 +1177,7 @@ final class CompletionCoordinator {
                         return !halt
                     }, onSample: { prob, isFirst in
                         gate.record(prob: Double(prob), isFirst: isFirst)
-                    })
+                    }, onWordBranches: onWordBranches)
                     if let key = preparedPrompt.cacheKey,
                        let budget = effectivePromptByteBudget {
                         self.storeTokenizerValidatedBudget(budget, for: key)

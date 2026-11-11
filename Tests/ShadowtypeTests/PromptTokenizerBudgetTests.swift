@@ -38,17 +38,19 @@ final class PromptTokenizerBudgetTests: XCTestCase {
         func generate(prompt: String, maxTokens: Int, seqID: Int32,
                       params: SamplingParams, requiredPrefix: [UInt8]?,
                       onToken: (String) -> Bool,
-                      onSample: ((Float, Bool) -> Void)?) throws {
+                      onSample: ((Float, Bool) -> Void)?,
+                      onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? = nil) throws {
             try generate(
                 prompt: prompt, maxTokens: maxTokens, seqID: seqID, params: params,
                 contextTokenCap: nil, requiredPrefix: requiredPrefix,
-                onToken: onToken, onSample: onSample)
+                onToken: onToken, onSample: onSample, onWordBranches: onWordBranches)
         }
 
         func generate(prompt: String, maxTokens: Int, seqID: Int32,
                       params: SamplingParams, contextTokenCap: Int?,
                       requiredPrefix: [UInt8]?, onToken: (String) -> Bool,
-                      onSample: ((Float, Bool) -> Void)?) throws {
+                      onSample: ((Float, Bool) -> Void)?,
+                      onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? = nil) throws {
             prompts.append(prompt)
             let cap = contextTokenCap ?? maxContextTokens
             let tokens = tokenCount(prompt)

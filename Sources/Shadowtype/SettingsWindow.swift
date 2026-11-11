@@ -1130,6 +1130,10 @@ private struct AppsDomainsPane: View {
                        "Offer a fix when the word you're typing looks like a typo.",
                        defaultOn: UserDefaults.standard.bool(forKey: "GW.autocorrectEnabled"),
                        state: model.configBinding(\.autocorrect, bundleId: key))
+                triRow("Auto-show word alternatives",
+                       "While typing a word, show a numbered list of completions; type 1, 2, 3… to insert one. Fires while typing, not on a pause.",
+                       defaultOn: false,
+                       state: model.configBinding(\.wordAlternatives, bundleId: key))
                 triRow("Disable Tab key",
                        "Stop Tab from accepting completions, for apps where Tab has native use.",
                        defaultOn: false,

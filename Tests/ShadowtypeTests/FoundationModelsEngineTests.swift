@@ -122,7 +122,8 @@ final class FoundationModelsEngineTests: XCTestCase {
         func releaseSeq(_ seqID: Int32) {}
         func generate(prompt: String, maxTokens: Int, seqID: Int32, params: SamplingParams,
                       requiredPrefix: [UInt8]?, onToken: (String) -> Bool,
-                      onSample: ((Float, Bool) -> Void)?) throws {
+                      onSample: ((Float, Bool) -> Void)?,
+                      onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? = nil) throws {
             calls += 1
             if let failure { throw failure }
             if !output.isEmpty { _ = onToken(output) }

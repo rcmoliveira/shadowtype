@@ -33,16 +33,22 @@ struct AppConfig: Codable, Equatable {
     // Default OFF (terminals stay quiet); the global default passed at resolve() is false. The
     // force-activate hotkey produces a command regardless of this toggle.
     var shellCommands: TriState
+    // "Auto-show word alternatives" (FlowIn port): while typing mid-word, fire early and attach a
+    // numbered list of word completions (type 1/2/3… to insert). Default OFF — opt-in interaction
+    // change; the global default passed at resolve() is false.
+    var wordAlternatives: TriState
 
     init(midLine: TriState = .auto, autocorrect: TriState = .auto,
          disableTab: TriState = .auto, collectInputs: TriState = .auto,
-         rightArrowAccept: TriState = .auto, shellCommands: TriState = .auto) {
+         rightArrowAccept: TriState = .auto, shellCommands: TriState = .auto,
+         wordAlternatives: TriState = .auto) {
         self.midLine = midLine
         self.autocorrect = autocorrect
         self.disableTab = disableTab
         self.collectInputs = collectInputs
         self.rightArrowAccept = rightArrowAccept
         self.shellCommands = shellCommands
+        self.wordAlternatives = wordAlternatives
     }
 
     // Tolerant: a field absent from an older file falls back to .auto (the inert default).
@@ -54,6 +60,7 @@ struct AppConfig: Codable, Equatable {
         collectInputs    = try c.decodeIfPresent(TriState.self, forKey: .collectInputs) ?? .auto
         rightArrowAccept = try c.decodeIfPresent(TriState.self, forKey: .rightArrowAccept) ?? .auto
         shellCommands    = try c.decodeIfPresent(TriState.self, forKey: .shellCommands) ?? .auto
+        wordAlternatives = try c.decodeIfPresent(TriState.self, forKey: .wordAlternatives) ?? .auto
     }
 
     /// An all-`.auto` config carries no overrides — used to prune empty entries so the store and the
@@ -61,6 +68,7 @@ struct AppConfig: Codable, Equatable {
     var isDefault: Bool {
         midLine == .auto && autocorrect == .auto && disableTab == .auto
             && collectInputs == .auto && rightArrowAccept == .auto && shellCommands == .auto
+            && wordAlternatives == .auto
     }
 }
 

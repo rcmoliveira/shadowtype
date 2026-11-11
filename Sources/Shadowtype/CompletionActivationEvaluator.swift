@@ -34,6 +34,10 @@ struct CompletionActivationEvaluator {
         // A `;name` snippet trigger is being typed. Like emojiTrigger it only bypasses the word-boundary
         // gate, so a partial name ending in `-`/`_` still resolves; every other gate applies.
         var snippetTrigger = false
+        // "Auto-show word alternatives" is on for this app AND the caret is mid-word. Like the emoji/
+        // snippet triggers it only bypasses the word-boundary gate — the generation it enables is the
+        // same mid-word (Tier 2a healed) completion, just fired while typing so the menu keeps up.
+        var wordTrigger = false
     }
 
     struct PrefixEvaluation {
@@ -114,7 +118,7 @@ struct CompletionActivationEvaluator {
         } ?? false
 
         guard shellMode || isMeaningfulBoundary(prefix) || snapshot.emojiTrigger
-                || snapshot.snippetTrigger else {
+                || snapshot.snippetTrigger || snapshot.wordTrigger else {
             return PrefixEvaluation(decision: .skip(.notBoundary), capabilityGate: gate)
         }
         guard hasUsefulContext(prefix, minPrefixChars: snapshot.minPrefixChars) else {

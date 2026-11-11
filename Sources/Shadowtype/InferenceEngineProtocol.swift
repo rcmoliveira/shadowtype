@@ -87,7 +87,8 @@ protocol InferenceEngineProtocol: AnyObject {
                   contextTokenCap: Int?,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)?) throws
 }
 
 extension InferenceEngineProtocol {

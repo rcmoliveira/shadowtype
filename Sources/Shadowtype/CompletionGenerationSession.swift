@@ -7,6 +7,11 @@ final class CompletionGenerationSession {
 
     var activePrefix = ""
     var isHealed = false
+    // "Auto-show word alternatives" menu for the current ghost: full-word completions of the typed
+    // stem, number-ordered (row n+1 is inserted by typing n+1 — see WordCompletion.select). nil =
+    // no menu visible. Populated by the engine's onWordBranches callback during a mid-word
+    // generation; read by the branch-menu HUD and the digit-accept tap.
+    var wordBranchMenu: [String]? = nil
     var shellMode = false
     var committed = false
     var inContextRefire = false
