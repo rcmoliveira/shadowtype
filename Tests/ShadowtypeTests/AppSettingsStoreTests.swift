@@ -89,6 +89,27 @@ final class AppSettingsStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.config(forBundleId: "com.apple.mail").collectInputs, .on)
     }
 
+    // Bundle ids are case-insensitive in LaunchServices; NSWorkspace hands back com.apple.Notes while
+    // hand-seeded files may carry com.apple.notes. A case slip must never silently drop an override —
+    // the runtime lookup missed the seeded lowercase key and the word-alternatives setting read .auto.
+    func testBundleIdLookupIsCaseInsensitive() {
+        let url = tempURL()
+        let store = AppSettingsStore(storeURL: url)
+        store.set(.on, \.wordAlternatives, forBundleId: "com.apple.Notes")
+        XCTAssertTrue(store.resolve(\.wordAlternatives, forBundleId: "com.apple.notes", globalDefault: false))
+        XCTAssertTrue(store.resolve(\.wordAlternatives, forBundleId: "COM.APPLE.NOTES", globalDefault: false))
+        XCTAssertEqual(store.config(forBundleId: "com.apple.notes").wordAlternatives, .on)
+    }
+
+    func testLoadNormalizesFileKeys() throws {
+        let url = tempURL()
+        // Simulate a file written with lowercase keys; the runtime queries the real (capitalized) id.
+        let json = #"{"version":1,"apps":{"com.apple.notes":{"wordAlternatives":"on","midLine":"auto","autocorrect":"auto","disableTab":"auto","collectInputs":"auto","rightArrowAccept":"auto","shellCommands":"auto"}}}"#
+        try json.data(using: .utf8)!.write(to: url)
+        let store = AppSettingsStore(storeURL: url)
+        XCTAssertTrue(store.resolve(\.wordAlternatives, forBundleId: "com.apple.Notes", globalDefault: false))
+    }
+
     func testWritesVersionedEnvelope() throws {
         let url = tempURL()
         let store = AppSettingsStore(storeURL: url)

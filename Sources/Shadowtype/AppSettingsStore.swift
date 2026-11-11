@@ -111,7 +111,13 @@ final class AppSettingsStore {
         self.createDirectory = createDirectory
         self.atomicWrite = atomicWrite
         let loaded = AppSettingsStore.load(from: storeURL)
-        self.byBundle = loaded.apps
+        // Bundle ids are case-insensitive in LaunchServices (NSWorkspace yields com.apple.Notes while
+        // hand-edited or migrated files may carry com.apple.notes). Normalize at every boundary so a
+        // case slip can never silently drop a user's override — the miss is invisible to the Settings UI,
+        // which reads the same file it writes.
+        var normalized: [String: AppConfig] = [:]
+        for (key, value) in loaded.apps { normalized[key.lowercased()] = value }
+        self.byBundle = normalized
         self.canPersist = loaded.canPersist
     }
 
@@ -120,7 +126,7 @@ final class AppSettingsStore {
     func config(forBundleId bundleId: String?) -> AppConfig {
         guard let bundleId else { return AppConfig() }
         lock.lock(); defer { lock.unlock() }
-        return byBundle[bundleId] ?? AppConfig()
+        return byBundle[bundleId.lowercased()] ?? AppConfig()
     }
 
     /// Resolve one field for an app against its global default. Convenience over config()+TriState.resolve.
@@ -145,11 +151,12 @@ final class AppSettingsStore {
     ) -> Bool {
         guard !bundleId.isEmpty else { return false }
         lock.lock()
+        let key = bundleId.lowercased()   // case-insensitive keys — see init normalization note
         let previous = byBundle
-        var cfg = byBundle[bundleId] ?? AppConfig()
+        var cfg = byBundle[key] ?? AppConfig()
         cfg[keyPath: field] = value
-        if cfg.isDefault { byBundle[bundleId] = nil }   // drop no-op entries
-        else { byBundle[bundleId] = cfg }
+        if cfg.isDefault { byBundle[key] = nil }   // drop no-op entries
+        else { byBundle[key] = cfg }
         guard byBundle != previous else {
             lock.unlock()
             return true
@@ -171,7 +178,7 @@ final class AppSettingsStore {
     @discardableResult
     func clear(bundleId: String) -> Bool {
         lock.lock()
-        guard let previousConfig = byBundle.removeValue(forKey: bundleId) else {
+        guard let previousConfig = byBundle.removeValue(forKey: bundleId.lowercased()) else {
             lock.unlock()
             return true
         }
