@@ -1401,8 +1401,8 @@ final class EditContextTracker {
             if lastGlobalSecureInputLog == nil
                 || Date().timeIntervalSince(lastGlobalSecureInputLog!) > 60 {
                 lastGlobalSecureInputLog = Date()
-                Diag.log("secure-input: global secure-event-input is ON (held by another process, "
-                    + "e.g. sudo prompt or password manager) — suggestions suppressed app-wide")
+                Diag.log("secure-input: global secure-event-input is ON — held by "
+                    + "\(SecureInputOwner.describe()) — suggestions suppressed app-wide")
             }
             return true
         }
