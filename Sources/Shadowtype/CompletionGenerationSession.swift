@@ -12,6 +12,9 @@ final class CompletionGenerationSession {
     // no menu visible. Populated by the engine's onWordBranches callback during a mid-word
     // generation; read by the branch-menu HUD and the digit-accept tap.
     var wordBranchMenu: [String]? = nil
+    // The stem the menu was built for — acceptance types `row.dropFirst(stem.count)` at the caret.
+    // Safe against staleness because any keystroke after the menu arrives runs cancel→clearSuggestion.
+    var wordBranchStem: String? = nil
     var shellMode = false
     var committed = false
     var inContextRefire = false

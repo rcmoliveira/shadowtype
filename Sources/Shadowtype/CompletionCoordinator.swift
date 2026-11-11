@@ -198,6 +198,9 @@ final class CompletionCoordinator {
     // TabSwallowTap.setSuggestionVisible(_:) so Tab is only swallowed while a ghost is
     // shown (the tap reads this atomically on its own thread — see TabSwallowTap).
     var onSuggestionVisibleChanged: ((Bool) -> Void)?
+    // Row count of the visible word-alternatives menu → AppDelegate → TabSwallowTap.setWordMenuRows,
+    // so the tap swallows digits only while rows are actually on screen.
+    var onWordMenuRowsChanged: ((Int) -> Void)?
 
     // Snapshot of caretAtLineEnd pushed at every ghost show + accept-advance so the
     // TabSwallowTap can gate Right Arrow accepts without a sync AX call from the tap thread.
@@ -1090,6 +1093,8 @@ final class CompletionCoordinator {
                 DispatchQueue.main.async {
                     guard self.isCurrent(myGen) else { return }
                     self.generationSession.wordBranchMenu = menu.isEmpty ? nil : menu
+                    self.generationSession.wordBranchStem = menu.isEmpty ? nil : stem
+                    self.onWordMenuRowsChanged?(menu.count)
                     // No resolved caret → keep the menu in the session but don't paint at (0,0);
                     // the ghost render path resolves the caret moments later anyway.
                     if menu.isEmpty {
@@ -1494,6 +1499,28 @@ final class CompletionCoordinator {
         return n
     }
 
+    // Digit acceptance for "auto show word alternatives" (FlowIn port): the tap swallowed digit N
+    // because the HUD showed ≥N rows; insert that row's word. The menu can only be as fresh as the
+    // last keystroke (every keystroke runs cancel→clearSuggestion, which drops the menu and pushes
+    // rows=0 to the tap), so `row.dropFirst(stem.count)` is exactly what the caret still needs.
+    func acceptWordBranch(_ digit: Int) -> Int {
+        guard let menu = generationSession.wordBranchMenu,
+              let row = WordCompletion.select(menu: menu, digit: digit) else { return 0 }
+        guard let target = acceptanceTarget() else { return 0 }
+        let stem = generationSession.wordBranchStem ?? ""
+        guard row.hasPrefix(stem) else { return 0 }
+        let toType = String(row.dropFirst(stem.count))
+        if toType.isEmpty { clearSuggestion(); return 0 }
+        guard inject(toType, into: target) else { return 0 }
+        countAcceptanceOnce()
+        wordMeter?.recordKeystrokesSaved(WordMeter.keystrokesSaved(accepting: toType))
+        bumpGeneration()
+        engine.requestCancel()
+        clearSuggestion()
+        recordStyle(toType)   // FR-CTX-3: learn from the accepted word
+        return WordMeter.wordCount(in: row)
+    }
+
     // Inject the whole current line of the suggestion (up to the first newline).
     func acceptLine() -> Int {
         if let fix = ghostPresentation.correctionSuggestion { return acceptCorrection(fix) }
@@ -1860,7 +1887,9 @@ final class CompletionCoordinator {
         // The branch menu belongs to the ghost that just went away — a stale numbered list under a
         // dead caret would be worse than no menu (its digits would still be swallowed by the tap).
         generationSession.wordBranchMenu = nil
+        generationSession.wordBranchStem = nil
         wordBranchHUD.hide()
+        onWordMenuRowsChanged?(0)
     }
 
     // MARK: - Host font watch (FR-OV-4)

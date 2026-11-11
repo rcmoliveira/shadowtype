@@ -307,6 +307,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.applyAccept(self.coordinator.acceptLine())
         }
+        // "Auto-show word alternatives": a swallowed menu digit inserts that numbered row (FlowIn
+        // port). The tap already gated digit-vs-typing via the visible row count; the coordinator
+        // re-checks against its own session copy before injecting anything.
+        tabSwallow.onAcceptBranch = { [weak self] digit in
+            guard let self else { return }
+            self.applyAccept(self.coordinator.acceptWordBranch(digit))
+        }
+        coordinator.onWordMenuRowsChanged = { [weak self] rows in
+            self?.tabSwallow.setWordMenuRows(rows)
+        }
 
         // A left-click on the badge opens the scoped disable/settings menu (Cotypist parity), rebuilt
         // each click so it reflects the current frontmost app + domain.
