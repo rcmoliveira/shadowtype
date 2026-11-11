@@ -1101,13 +1101,19 @@ final class CompletionCoordinator {
                     self.generationSession.wordBranchStem = menu.isEmpty ? nil : stem
                     self.onWordMenuRowsChanged?(menu.count)
                     // No resolved caret → keep the menu in the session but don't paint at (0,0);
-                    // the ghost render path resolves the caret moments later anyway.
+                    // the ghost render path resolves the caret moments later anyway (it re-shows
+                    // the HUD from the session menu — see render path).
                     if menu.isEmpty {
                         self.wordBranchHUD.hide()
-                    } else if let caret = self.generationSession.caretRect {
+                        Diag.log("gen: word menu rows=0 (cleared)")
+                    } else if let caret = self.generationSession.caretRect, !caret.isNull {
                         self.wordBranchHUD.show(menu: menu, at: caret)
+                        Diag.log("gen: word menu rows=\(menu.count) shown=\(self.wordBranchHUD.isVisible) "
+                               + "at=\(Int(caret.minX)),\(Int(caret.minY)) top=\(menu.prefix(3))")
+                    } else {
+                        // The real suspect for "menu not displayed": caret unresolved at callback time.
+                        Diag.log("gen: word menu rows=\(menu.count) caret=null — deferred to render")
                     }
-                    Diag.log("gen: word menu rows=\(menu.count) top=\(menu.prefix(3))")
                 }
             } : nil
 
@@ -1744,6 +1750,14 @@ final class CompletionCoordinator {
         let caret = caretOverride ?? generationSession.caretRect ?? (context.caretRectOnScreen() ?? .null)
         let caretDesc = caret.isNull ? "null" : "\(Int(caret.minX)),\(Int(caret.minY))"
         Diag.log("render: show len=\(display.count) caret=\(caretDesc)")
+        // The branch menu may have been computed before the caret resolved (callback logged
+        // "caret=null — deferred to render"). The ghost painting here proves a live caret; if a menu
+        // is pending and the HUD isn't up, paint it now at the same anchor the ghost uses.
+        if let menu = generationSession.wordBranchMenu, !menu.isEmpty,
+           !wordBranchHUD.isVisible, !caret.isNull {
+            wordBranchHUD.show(menu: menu, at: caret)
+            Diag.log("render: word hud re-shown rows=\(menu.count) shown=\(wordBranchHUD.isVisible)")
+        }
         Diag.logContent("render: show \"\(display.prefix(40))\"")
         // #2: hold the existing panel geometry across reconcile ticks (every streamed token, the
         // post-accept remainder re-render) unless something the user can see actually changed — focus
