@@ -830,16 +830,26 @@ final class InferenceEngine: InferenceEngineProtocol {
                 return
             }
             if !alreadyAccepted { llama_sampler_accept(smpl, tok) }
-            // Expand the branch menu HERE — before `tok` is decoded, the KV cache holds exactly the
-            // prompt (stem end), so each alternative continuation decodes forward from there and is
-            // truncated away again; the main path's own decode of `tok` then proceeds untouched.
             if wantsBranches, let topK, let stemForBranches {
-                let branches = expandWordBranches(topK: topK, stemBytes: stemForBranches,
-                                                  ctx: ctx, vocab: vocab, batch: &batch,
-                                                  seqID: seqID, nPast: nPast, nVocab: nVocab,
-                                                  cancellationRequest: cancellationRequest)
-                Diag.log("engine: word-branch expand topK=\(topK.count) branches=\(branches.count)")
-                onWordBranches?(branches)
+                // Menu WITHOUT decoding (replaces the KV-rewind expansion, which corrupted the
+                // hybrid/SWA cache: seq_rm can return false on partial sliding-window tails —
+                // see the reuse-path Spike-5 comment — leaving positions occupied → the next
+                // llama_decode returns -1 and kills the main generation: decodeFailed(-1)).
+                // The raw top-K first tokens ARE the branch set: a token either re-emits the
+                // stem (mask-admissible, e.g. " message" → strip the stem bytes → "age") or is
+                // the post-stem continuation directly ("age", "ages", "y"). branchMenu prepends
+                // the stem, cuts to one word, dedupes ("age" from both routes), orders by prob.
+                let raw: [(remainder: String, prob: Float)] = topK.compactMap { t in
+                    let tb = tokenBytesSlice(t.token)
+                    let rest: ArraySlice<UInt8>
+                    if stemForBranches.starts(with: tb) { rest = [] }                      // inside stem
+                    else if tb.starts(with: stemForBranches) { rest = tb.dropFirst(stemForBranches.count) }
+                    else { rest = tb }                                                      // post-stem
+                    let s = String(decoding: rest, as: UTF8.self)
+                    return s.isEmpty ? nil : (remainder: s, prob: t.prob)
+                }
+                Diag.log("engine: word-branch topK raw=\(raw.count)")
+                onWordBranches?(raw)
             }
             let hadContentBefore = sawNonSpace
 
@@ -951,80 +961,6 @@ final class InferenceEngine: InferenceEngineProtocol {
             let tail = pending.trimmingCharacters(in: .whitespacesAndNewlines)
             if !tail.isEmpty { _ = onToken(pending) }
         }
-    }
-
-    // Word-branch expansion for the "auto show word alternatives" menu (FlowIn port). Called at
-    // the FIRST content token of a stem-constrained generation, BEFORE that token is decoded: the
-    // KV cache then holds exactly the prompt (stem end), so each top-K continuation decodes
-    // forward from there and is truncated away with llama_memory_seq_rm — the same rewind the
-    // prefix-reuse path already relies on. The main loop's own decode of the top-1 token then
-    // proceeds at the identical position: byte-identical KV, zero behavior change for the ghost.
-    //
-    // Each branch: decode the candidate token, then greedy-continue — stem-masked until the stem
-    // bytes are consumed, plain argmax after — until a whitespace closes the word, EOG, or the
-    // 5-token cap (words after a ≥2-letter stem almost never exceed 3-4 tokens). Returns the
-    // post-stem remainders + each branch's FIRST-token raw probability (the menu's sort key).
-    // Cost: ~2 decodes per branch, ~10 total, on a warm KV — tens of ms, and the menu appears
-    // WITH the ghost, exactly like FlowIn's zero-delay branch menu.
-    private func expandWordBranches(topK: [(token: llama_token, prob: Float)],
-                                    stemBytes: [UInt8],
-                                    ctx: OpaquePointer, vocab: OpaquePointer,
-                                    batch: inout llama_batch, seqID: Int32,
-                                    nPast: Int32, nVocab: Int,
-                                    cancellationRequest: CancellationRegistry.Request)
-        -> [(remainder: String, prob: Float)] {
-        var branches: [(remainder: String, prob: Float)] = []
-        let mem = llama_get_memory(ctx)
-        let stemEnd = nPast   // the first token is not decoded yet: KV holds exactly the prompt
-        for branch in topK {
-            if cancellations.isCancelled(cancellationRequest) { break }
-            var word = ""
-            var decoder = UTF8StreamDecoder()
-            var rem = stemBytes[...]
-            var tok = branch.token
-            var n = stemEnd
-            var healthy = true
-            for _ in 0..<5 {
-                batch.token[0] = tok
-                batch.pos[0] = n
-                batch.n_seq_id[0] = 1
-                batch.seq_id[0]![0] = seqID
-                batch.logits[0] = 1
-                batch.n_tokens = 1
-                if llama_decode(ctx, batch) != 0 { healthy = false; break }
-                n += 1
-                let tb = tokenBytesSlice(tok)
-                let consumed = min(tb.count, rem.count)
-                word += decoder.push(Array(tb.dropFirst(consumed)))   // post-stem text only
-                rem = rem.dropFirst(consumed)
-                if word.contains(where: { $0.isWhitespace }) {        // word closed: menu row is one word
-                    word = String(word.prefix(while: { !$0.isWhitespace }))
-                    break
-                }
-                guard let lg = llama_get_logits_ith(ctx, -1) else { healthy = false; break }
-                // Greedy next token, stem-masked while stem bytes are still pending (a top-K token
-                // may be SHORTER than the stem, e.g. "t" for stem "institu" — the mask keeps the
-                // continuation legal). Full-vocab argmax, same sweep shape as sampleWithProb.
-                var best = llama_token(-1)
-                var bestLogit = -Float.infinity
-                for v in 0..<nVocab {
-                    var l = lg[v]
-                    if !rem.isEmpty,
-                       !RequiredPrefix.isAdmissible(tokenBytes: tokenBytesSlice(llama_token(v)),
-                                                    remaining: rem) {
-                        l = -.infinity
-                    }
-                    if l > bestLogit { bestLogit = l; best = llama_token(v) }
-                }
-                if best < 0 || llama_vocab_is_eog(vocab, best) { break }
-                tok = best
-            }
-            word += decoder.finish()
-            _ = llama_memory_seq_rm(mem, seqID, stemEnd, -1)   // rewind to stem end for next branch
-            guard healthy else { break }   // decode failure: engine is unwell, abandon the menu
-            if !word.isEmpty { branches.append((word, branch.prob)) }
-        }
-        return branches
     }
 
     // API/MCP decode loop — raw token-piece stream, no word buffering or sentence stops. Honors
