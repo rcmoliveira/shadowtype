@@ -449,7 +449,10 @@ final class CompletionCoordinator {
         guard isEnabled, engine.isLoaded, !rewriteActive else { return }   // don't supersede a live rewrite
         // Teach the app before firing: the fire() below reads the sticky flag through the same path a
         // later keystroke will use, so the very first force and every later one take identical routes.
+        // Scoped to the auto-idle classes (terminals/editors) — in Mail or Slack `isIdle` is already
+        // false, so writing the flag there would be a pure no-op that still costs a Settings row.
         if let bundleId = context.frontmostBundleId,
+           ActivationPolicy.isManaged(bundleId: bundleId),
            !appSettings.resolve(\.suggestHere, forBundleId: bundleId, globalDefault: false) {
             appSettings.set(.on, \.suggestHere, forBundleId: bundleId)
             Diag.log("force: taught suggestHere for \(bundleId)")
