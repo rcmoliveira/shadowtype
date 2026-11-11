@@ -240,10 +240,11 @@ final class CompletionCoordinator {
     var adaptivePause = true
     var pauseMultiplier: Double = 2.3
     // Hard cap on the wait. In practice this only binds for slow/hunt-peck typists (large median IKI).
-    // Was 1.0 s — the single most visible "it's slow to react" number: a 400 ms-cadence typist waited
-    // 920 ms before generation even started, then paid a cold prefill on top. 0.6 s still sits at the
-    // top of the deliberate "thinking pause" band the research uses, and the eager warm below hides
-    // most of the remaining prefill cost, so the ghost lands well inside a second of the pause.
+    // Was 1.0 s — the single most visible "slow to react" number: a 400 ms-cadence typist waited
+    // 920 ms before generation even started, then paid the prefill on top. 0.6 s still sits at the top
+    // of the deliberate "thinking pause" band the research uses. Modelled end-to-end (pause + prefill +
+    // first token), ceiling + the eager warm together take the ghost from 1.66 s to 0.91 s at a 400 ms
+    // cadence (-45%) and from 0.90 s to 0.74 s for a fast typist (-18%).
     private let adaptivePauseCeiling: TimeInterval = 0.6
     // Monotonic timestamp of the previous keystroke and a small ring of recent inter-keystroke intervals
     // (session-break gaps excluded) used to estimate the user's natural cadence. Main-thread only.
@@ -291,6 +292,11 @@ final class CompletionCoordinator {
     // The speculative KV warm armed mid-debounce (eager prefill). Cancelled with the debounce work so a
     // keystroke that arrives before it starts costs nothing; a warm already running stops via requestCancel.
     private var eagerWarmWork: DispatchWorkItem?
+    // True while a warmAssembledPrompt is queued/running on the serial inference queue. Set on main
+    // before dispatch, cleared back on main when the generate returns — main-only, so no locking.
+    // Two warms queued back-to-back add nothing (the second re-derives the first's KV) and push the
+    // real fire() further behind, which is the opposite of the point.
+    private var warmInFlight = false
 
     private let generationSession = CompletionGenerationSession()
     // Memo for applyGlueGuard: renderSuggestion runs on every streamed token snapshot, but for a fixed
@@ -355,20 +361,30 @@ final class CompletionCoordinator {
     }
 
     // Eager prefill (FlowIn's `eagerPrefillEnabled`): the debounce wait is dead inference time. The
-    // prefix stops changing the moment the user pauses, yet the cold prefill (~0.4–0.9 s on a long
-    // prompt) only started at fire(). Prefilling the CURRENT prefix into the KV cache halfway through
-    // the wait means the real fire() rides warm KV (~65 ms appended-token prefill) and its first token
-    // lands that much sooner — the pause and the prefill overlap instead of serializing.
-    // If typing resumes, cancel() drops the pending warm; a running one stops at engine.requestCancel()
-    // between prefill chunks, and its partial KV is still a prefix of the next prompt, so nothing is
-    // thrown away (FR-CE-5: warm KV survives appends).
+    // prefix stops changing the moment the user pauses, yet the cold prefill only started at fire().
+    // The point is to overlap the two instead of serializing them.
+    // TIMING IS THE WHOLE GAME. A cold prefill runs 400–800 ms while the adaptive pause is only
+    // 161–600 ms, so a warm started at the midpoint NEVER finishes before fire() — it would save
+    // half the wait, not the prefill. So the lead is the prefill estimate itself: start at
+    // `delay - prefill`, which for every real pause is t≈0, i.e. warm on the keystroke. When the
+    // prefill still can't finish in time, the partial KV is retained anyway and fire() then pays only
+    // the appended tokens (~65 ms) — a warm is never "dead work" the way a cancelled generation is,
+    // because warm KV survives appends (FR-CE-5).
+    // If typing resumes, cancel() drops the pending warm and engine.requestCancel() stops a running
+    // one between prefill chunks.
     private func scheduleEagerWarm(delay: TimeInterval) {
-        // Only worth scheduling when there's real wait to hide cost under. At the ~120 ms floor the
-        // warm finishes nowhere near time anyway, and a fast typist's next keystroke cancels it.
-        guard delay >= 0.25 else { return }
+        // Sub-150 ms waits are a fast typist mid-burst: the warm would be cancelled almost at once
+        // and the GPU churn buys nothing (and heat feeds back into PowerPolicy's longer pauses).
+        guard delay >= 0.15 else { return }
+        // Same size-scaled prefill estimate the first-token deadline uses, so the two agree about how
+        // long a prefill takes. Sized from the LAST fired prefix (generationSession.activePrefix),
+        // not a fresh AX read: an AX value read is an IPC round-trip and this runs per keystroke.
+        // One keystroke of staleness is harmless — it only shifts a start time by tens of ms.
+        let lead = Self.generationDeadline(promptBytes: generationSession.activePrefix.utf8.count)
+        let startAt = max(0, delay - lead)
         let warmWork = DispatchWorkItem { [weak self] in self?.eagerWarm() }
         eagerWarmWork = warmWork
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay * 0.5, execute: warmWork)
+        DispatchQueue.main.asyncAfter(deadline: .now() + startAt, execute: warmWork)
     }
 
     // The warm itself. Same guards as warmFocus() minus its focus-scoped bookkeeping (OCR cache reset,
@@ -376,6 +392,9 @@ final class CompletionCoordinator {
     private func eagerWarm() {
         eagerWarmWork = nil
         guard isEnabled, engine.isLoaded, !rewriteActive else { return }
+        // Pile-up guard: warms queue on the serial inference queue, so a second one behind a first
+        // adds nothing but latency for the real fire() that follows.
+        guard !warmInFlight else { return }
         guard !context.isSecureField() else { return }
         if let appRules, !appRules.isEnabled(bundleId: context.frontmostBundleId,
                                              domain: context.frontmostDomainHost()) { return }
@@ -1426,12 +1445,16 @@ final class CompletionCoordinator {
     private func warmAssembledPrompt(prefix: String, postCaret: String?) {
         let myGen = bumpGeneration()
         let warmPrompt = assembledPrompt(prefix: prefix, postCaret: postCaret)
+        // Main-thread bookkeeping before the hop: callers (focus warm, eager warm) read this to avoid
+        // stacking a second warm behind the first on the serial queue.
+        warmInFlight = true
         inferenceQueue.async { [weak self] in
             guard let self else { return }
             _ = myGen
             // One token is enough to force the full prefill into the KV cache; we stop immediately and
             // never display warm-up output (side effect = warm ctx).
             try? self.engine.generate(prompt: warmPrompt, maxTokens: 1) { _ in false }
+            DispatchQueue.main.async { self.warmInFlight = false }
         }
     }
 
