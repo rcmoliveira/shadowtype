@@ -81,7 +81,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // P2
     lazy var coordinator = CompletionCoordinator(engine: engine, overlay: overlay, context: contextTracker)
     // Force-activate completions in the focused field (default ⌃`), even where Shadowtype is idle by
-    // default (terminals/editor surfaces). Mirrors the menu's "Force suggestions here".
+    // default (terminals/editor surfaces). The first press also teaches the app (sticky suggestHere),
+    // so the app stops staying idle — this is the only override affordance now.
     let forceHotKey = GlobalHotKey()
     // Local "rewrite selected text" (default ⌥⌘K): read the selection, pick an action, rewrite it
     // on-device, preview inline. Distinct hotkey id from forceHotKey (id 2 vs 1).
@@ -335,7 +336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.refreshBadge()
             self.warmFocusIfFocusChanged()
         }
-        // Global force-activate hotkey (⌃`): same effect as the menu's "Force suggestions here".
+        // Global force-activate hotkey (⌃`): fires now in an idle field AND teaches the app (sticky).
         forceHotKey.onPress = { [weak self] in
             guard let self, self.permissionLifecycle?.isRunning == true else { return }
             self.coordinator.forceActivate()

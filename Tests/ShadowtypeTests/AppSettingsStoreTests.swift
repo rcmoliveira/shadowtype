@@ -67,6 +67,41 @@ final class AppSettingsStoreTests: XCTestCase {
         XCTAssertTrue(store.configuredBundleIds().isEmpty)
     }
 
+    // MARK: - Sticky "suggest here" (the ⌃` teaching gesture that replaced the menu override)
+
+    // An untaught app resolves to the global default (false) — auto-idle behavior is untouched.
+    func testSuggestHereDefaultsToAutoAndKeepsAppIdle() {
+        let store = AppSettingsStore(storeURL: tempURL())
+        XCTAssertEqual(store.config(forBundleId: "com.apple.Terminal").suggestHere, .auto)
+        XCTAssertFalse(store.resolve(\.suggestHere, forBundleId: "com.apple.Terminal", globalDefault: false))
+    }
+
+    // One teach sticks: the app resolves true against the same false global default, and survives a
+    // reload (this is what makes the old per-visit menu override unnecessary).
+    func testSuggestHereSticksAndPersists() {
+        let url = tempURL()
+        do {
+            let store = AppSettingsStore(storeURL: url)
+            store.set(.on, \.suggestHere, forBundleId: "com.apple.Terminal")
+            XCTAssertTrue(store.resolve(\.suggestHere, forBundleId: "com.apple.Terminal", globalDefault: false))
+        }
+        let reloaded = AppSettingsStore(storeURL: url)
+        XCTAssertTrue(reloaded.resolve(\.suggestHere, forBundleId: "com.apple.Terminal", globalDefault: false))
+        // An .on suggestHere is a real override — it must not be pruned as a no-op row.
+        XCTAssertEqual(reloaded.configuredBundleIds(), ["com.apple.Terminal"])
+    }
+
+    // A file written by an older build has no suggestHere key; the tolerant decoder falls back to .auto
+    // rather than failing the load (which would quarantine the whole store).
+    func testSuggestHereMissingFromOldFileDecodesAsAuto() throws {
+        let url = tempURL()
+        let json = #"{"version":1,"apps":{"com.apple.mail":{"midLine":"on","autocorrect":"auto","disableTab":"auto","collectInputs":"auto","rightArrowAccept":"auto","shellCommands":"auto","wordAlternatives":"auto"}}}"#
+        try json.data(using: .utf8)!.write(to: url)
+        let store = AppSettingsStore(storeURL: url)
+        XCTAssertEqual(store.config(forBundleId: "com.apple.mail").suggestHere, .auto)
+        XCTAssertTrue(store.resolve(\.midLine, forBundleId: "com.apple.mail", globalDefault: false))
+    }
+
     func testClearRemovesApp() {
         let store = AppSettingsStore(storeURL: tempURL())
         store.set(.on, \.collectInputs, forBundleId: "com.apple.mail")

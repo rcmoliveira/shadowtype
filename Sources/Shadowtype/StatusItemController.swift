@@ -51,7 +51,6 @@ final class StatusItemController: NSObject {
     private let pauseItem   = NSMenuItem(title: "Pause for current app", action: nil, keyEquivalent: "")
     // "Disable for app ▸": its submenu is rebuilt live (NSMenuDelegate) from running visible apps.
     private let disableForAppItem = NSMenuItem(title: "Disable for app", action: nil, keyEquivalent: "")
-    private let forceItem   = NSMenuItem(title: "Force suggestions here", action: nil, keyEquivalent: "")
     // Auto-update: a persistent "Check for Updates…" item, plus an "Install Update…" item revealed only
     // once UpdateManager has a staged/available build.
     private let checkUpdatesItem  = NSMenuItem(title: "Check for Updates…", action: nil, keyEquivalent: "")
@@ -171,11 +170,9 @@ final class StatusItemController: NSObject {
         disableForAppItem.submenu = disableSub
         menu.addItem(disableForAppItem)
 
-        // Cotypist parity: a manual override for fields Shadowtype stays idle in by default (terminals,
-        // editor surfaces). Same effect as the ⌃` global hotkey, discoverable from the menu.
-        forceItem.target = self
-        forceItem.action = #selector(forceActivate)
-        menu.addItem(forceItem)
+        // The old "Force suggestions here" item is gone: ⌃` now TEACHES the app permanently (first press
+        // in an auto-idle app writes AppSettingsStore.suggestHere = .on), so a per-visit menu override
+        // no longer exists to offer. The .shadowtypeForceActivate notification stays for the hotkey path.
 
         menu.addItem(.separator())
 
@@ -312,10 +309,6 @@ final class StatusItemController: NSObject {
 
     @objc private func pauseForApp() {
         NotificationCenter.default.post(name: .shadowtypePauseForApp, object: nil)
-    }
-
-    @objc private func forceActivate() {
-        NotificationCenter.default.post(name: .shadowtypeForceActivate, object: nil)
     }
 
     @objc private func quit() {

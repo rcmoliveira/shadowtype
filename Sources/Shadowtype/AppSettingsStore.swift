@@ -37,11 +37,16 @@ struct AppConfig: Codable, Equatable {
     // numbered list of word completions (type 1/2/3… to insert). Default OFF — opt-in interaction
     // change; the global default passed at resolve() is false.
     var wordAlternatives: TriState
+    // Sticky "force suggestions here": one ⌃` press in an auto-idle app (terminal/editor) flips this
+    // to .on for that app, so the auto-idle gate is bypassed on every later fire there — the user
+    // teaches the app once instead of forcing it forever. Replaces the menu-bar escape hatch.
+    // Default .auto → resolve(.auto, globalDefault: false) keeps the app auto-idle until taught.
+    var suggestHere: TriState
 
     init(midLine: TriState = .auto, autocorrect: TriState = .auto,
          disableTab: TriState = .auto, collectInputs: TriState = .auto,
          rightArrowAccept: TriState = .auto, shellCommands: TriState = .auto,
-         wordAlternatives: TriState = .auto) {
+         wordAlternatives: TriState = .auto, suggestHere: TriState = .auto) {
         self.midLine = midLine
         self.autocorrect = autocorrect
         self.disableTab = disableTab
@@ -49,6 +54,7 @@ struct AppConfig: Codable, Equatable {
         self.rightArrowAccept = rightArrowAccept
         self.shellCommands = shellCommands
         self.wordAlternatives = wordAlternatives
+        self.suggestHere = suggestHere
     }
 
     // Tolerant: a field absent from an older file falls back to .auto (the inert default).
@@ -61,6 +67,7 @@ struct AppConfig: Codable, Equatable {
         rightArrowAccept = try c.decodeIfPresent(TriState.self, forKey: .rightArrowAccept) ?? .auto
         shellCommands    = try c.decodeIfPresent(TriState.self, forKey: .shellCommands) ?? .auto
         wordAlternatives = try c.decodeIfPresent(TriState.self, forKey: .wordAlternatives) ?? .auto
+        suggestHere      = try c.decodeIfPresent(TriState.self, forKey: .suggestHere) ?? .auto
     }
 
     /// An all-`.auto` config carries no overrides — used to prune empty entries so the store and the
@@ -68,7 +75,7 @@ struct AppConfig: Codable, Equatable {
     var isDefault: Bool {
         midLine == .auto && autocorrect == .auto && disableTab == .auto
             && collectInputs == .auto && rightArrowAccept == .auto && shellCommands == .auto
-            && wordAlternatives == .auto
+            && wordAlternatives == .auto && suggestHere == .auto
     }
 }
 

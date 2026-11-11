@@ -239,10 +239,12 @@ final class CompletionCoordinator {
     // AppDelegate mirrors `pauseMultiplier` from the Aggressiveness setting; both default to "balanced".
     var adaptivePause = true
     var pauseMultiplier: Double = 2.3
-    // Hard cap on the wait. In practice this only binds for slow/hunt-peck typists (large median IKI),
-    // for whom a longer wait is exactly right — a fast typist's median×multiplier stays well under it.
-    // Set above a deliberate "thinking pause" (~0.6–1.0 s) so we still fire on genuine pauses.
-    private let adaptivePauseCeiling: TimeInterval = 1.0
+    // Hard cap on the wait. In practice this only binds for slow/hunt-peck typists (large median IKI).
+    // Was 1.0 s — the single most visible "it's slow to react" number: a 400 ms-cadence typist waited
+    // 920 ms before generation even started, then paid a cold prefill on top. 0.6 s still sits at the
+    // top of the deliberate "thinking pause" band the research uses, and the eager warm below hides
+    // most of the remaining prefill cost, so the ghost lands well inside a second of the pause.
+    private let adaptivePauseCeiling: TimeInterval = 0.6
     // Monotonic timestamp of the previous keystroke and a small ring of recent inter-keystroke intervals
     // (session-break gaps excluded) used to estimate the user's natural cadence. Main-thread only.
     private var lastKeystrokeUptime: TimeInterval = 0
@@ -286,6 +288,9 @@ final class CompletionCoordinator {
 
     // MARK: - State (all mutated on main unless noted)
     private var debounceWork: DispatchWorkItem?
+    // The speculative KV warm armed mid-debounce (eager prefill). Cancelled with the debounce work so a
+    // keystroke that arrives before it starts costs nothing; a warm already running stops via requestCancel.
+    private var eagerWarmWork: DispatchWorkItem?
 
     private let generationSession = CompletionGenerationSession()
     // Memo for applyGlueGuard: renderSuggestion runs on every streamed token snapshot, but for a fixed
@@ -342,9 +347,53 @@ final class CompletionCoordinator {
         cancel()
         guard isEnabled, engine.isLoaded, !rewriteActive else { return }
 
+        let delay = adaptiveDelay(at: uptime)
         let work = DispatchWorkItem { [weak self] in self?.fire() }
         debounceWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + adaptiveDelay(at: uptime), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        scheduleEagerWarm(delay: delay)
+    }
+
+    // Eager prefill (FlowIn's `eagerPrefillEnabled`): the debounce wait is dead inference time. The
+    // prefix stops changing the moment the user pauses, yet the cold prefill (~0.4–0.9 s on a long
+    // prompt) only started at fire(). Prefilling the CURRENT prefix into the KV cache halfway through
+    // the wait means the real fire() rides warm KV (~65 ms appended-token prefill) and its first token
+    // lands that much sooner — the pause and the prefill overlap instead of serializing.
+    // If typing resumes, cancel() drops the pending warm; a running one stops at engine.requestCancel()
+    // between prefill chunks, and its partial KV is still a prefix of the next prompt, so nothing is
+    // thrown away (FR-CE-5: warm KV survives appends).
+    private func scheduleEagerWarm(delay: TimeInterval) {
+        // Only worth scheduling when there's real wait to hide cost under. At the ~120 ms floor the
+        // warm finishes nowhere near time anyway, and a fast typist's next keystroke cancels it.
+        guard delay >= 0.25 else { return }
+        let warmWork = DispatchWorkItem { [weak self] in self?.eagerWarm() }
+        eagerWarmWork = warmWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay * 0.5, execute: warmWork)
+    }
+
+    // The warm itself. Same guards as warmFocus() minus its focus-scoped bookkeeping (OCR cache reset,
+    // style snapshot), which belong to a focus change, not a pause.
+    private func eagerWarm() {
+        eagerWarmWork = nil
+        guard isEnabled, engine.isLoaded, !rewriteActive else { return }
+        guard !context.isSecureField() else { return }
+        if let appRules, !appRules.isEnabled(bundleId: context.frontmostBundleId,
+                                             domain: context.frontmostDomainHost()) { return }
+        // The shell prompt is assembled differently (assembleShellPrompt) — warming the prose prompt
+        // in a terminal diverges at token 0 and the whole warm is discarded (#11).
+        guard !ActivationPolicy.isTerminal(bundleId: context.frontmostBundleId) else { return }
+        // OCR capture still in flight: fire() will prepend a `Context:` block this warm can't know
+        // about — the exact divergence the focus warm defers for (#11).
+        if useScreenOCR, contextAssembler.captureState == .pending { return }
+        guard let prefix = context.currentPrefix(), !prefix.isEmpty,
+              CompletionActivationEvaluator.hasUsefulContext(prefix, minPrefixChars: minPrefixChars) else { return }
+        // Skip the fires that are a guaranteed .skip anyway — a speculative prefill for them is pure
+        // wasted GPU. These are the two cheapest pure gates from the real decision chain (the evaluator
+        // runs them on the same prefix); the stateful ones (typo, non-prose, daily cap) stay in fire().
+        guard CompletionActivationEvaluator.isMeaningfulBoundary(prefix),
+              !CompletionActivationEvaluator.endsCompleteStatement(prefix) else { return }
+        Diag.log("warm: eager prefill during debounce")
+        warmAssembledPrompt(prefix: prefix, postCaret: context.suffixAfterCaret())
     }
 
     // The idle wait before firing, adapted to the user's typing cadence (FR-KC-5; research 2511.18842).
@@ -390,20 +439,31 @@ final class CompletionCoordinator {
         return s.count % 2 == 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid]
     }
 
-    // Force-activate (global hotkey / menu "Force suggestions here"): trigger a suggestion for the
-    // focused field NOW, bypassing the auto-idle gate for this one shot. Skips the debounce (the user
-    // explicitly asked); every other safety gate — secure field, per-app/domain disable, boundary,
-    // min-context, daily cap — still applies.
+    // Force-activate (global hotkey ⌃`): trigger a suggestion for the focused field NOW, bypassing the
+    // auto-idle gate — AND remember that decision for the app. The first press in an auto-idle app
+    // (terminal/editor) fires one suggestion AND writes AppSettingsStore.suggestHere = .on, so every
+    // later fire there proceeds automatically. This replaces the old menu-bar "Force suggestions here"
+    // escape hatch, which had to be re-clicked forever. Every safety gate — secure field, per-app/domain
+    // disable, boundary, min-context, daily cap — still applies; the debounce is skipped (explicit ask).
     func forceActivate() {
         guard isEnabled, engine.isLoaded, !rewriteActive else { return }   // don't supersede a live rewrite
+        // Teach the app before firing: the fire() below reads the sticky flag through the same path a
+        // later keystroke will use, so the very first force and every later one take identical routes.
+        if let bundleId = context.frontmostBundleId,
+           !appSettings.resolve(\.suggestHere, forBundleId: bundleId, globalDefault: false) {
+            appSettings.set(.on, \.suggestHere, forBundleId: bundleId)
+            Diag.log("force: taught suggestHere for \(bundleId)")
+        }
         cancel()                  // clear any pending/in-flight work + ghost first
-        fire(forced: true)        // bypass the auto-idle gate for this one explicit trigger
+        fire(forced: true)        // bypass the auto-idle gate for this explicit trigger
     }
 
     // Cancel in-flight generation + pending debounce, hide the ghost (FR-CE-4).
     func cancel() {
         debounceWork?.cancel()
         debounceWork = nil
+        eagerWarmWork?.cancel()
+        eagerWarmWork = nil
         bumpGeneration()           // supersede any in-flight closure
         engine.requestCancel()     // cooperative stop between chunks/tokens
         contextAssembler.refireCount = 0     // a new keystroke/focus/force re-arms the one context-upgrade re-fire
@@ -714,7 +774,11 @@ final class CompletionCoordinator {
         let originalPrefix = snapshot?.prefix
         let rawPrefix = Self.prefixAfterEmailQuoteStrip(originalPrefix, host: host)
         let bundleId = context.frontmostBundleId
-        let managed = !forced && ActivationPolicy.isManaged(bundleId: bundleId)
+        // Sticky "suggest here": one ⌃` press in an auto-idle app teaches it permanently (AppSettingsStore
+        // .on), so the same app never needs forcing again. The menu-bar escape hatch is thereby obviated —
+        // the hotkey stays as the teaching gesture.
+        let taughtHere = appSettings.resolve(\.suggestHere, forBundleId: bundleId, globalDefault: false)
+        let managed = !(forced || taughtHere) && ActivationPolicy.isManaged(bundleId: bundleId)
         let heights = managed && ActivationPolicy.isEditor(bundleId: bundleId)
             ? context.focusedFieldAndWindowHeights() : nil
         let shellOptIn = managed && ActivationPolicy.isTerminal(bundleId: bundleId)
@@ -728,7 +792,7 @@ final class CompletionCoordinator {
             && (rawPrefix.flatMap { WordCompletion.stem(beforeCaret: $0) } != nil)
         let prefixEvaluation = CompletionActivationEvaluator.evaluatePrefix(
             .init(
-                forced: forced,
+                forced: forced || taughtHere,
                 bundleId: bundleId,
                 terminalText: shellBuffer,
                 editorFieldHeight: heights?.field,

@@ -1126,6 +1126,14 @@ private struct AppsDomainsPane: View {
                            defaultOn: false,
                            state: model.configBinding(\.shellCommands, bundleId: key))
                 }
+                // Only meaningful where Shadowtype stays idle by default. Set automatically by the first
+                // ⌃` press in the app; exposed here so the teaching is visible and reversible.
+                if ActivationPolicy.isManaged(bundleId: key) {
+                    triRow("Suggest here",
+                           "You turned suggestions on in this app with ⌃`. It stays on for every field here after that. Set it back to Off to return this app to idle-by-default.",
+                           defaultOn: false,
+                           state: model.configBinding(\.suggestHere, bundleId: key))
+                }
                 triRow("Autocorrect",
                        "Offer a fix when the word you're typing looks like a typo.",
                        defaultOn: UserDefaults.standard.bool(forKey: "GW.autocorrectEnabled"),
@@ -1406,7 +1414,7 @@ private struct ShortcutsPane: View {
         .init(action: "Accept next word", note: "Take one word from the current suggestion. Right Arrow also works at end-of-line when enabled.", keys: ["Tab"]),
         .init(action: "Accept whole line", note: "Take the entire suggested line at once. Right Arrow can do this too — see below.", keys: ["⌥", "Tab"]),
         .init(action: "Dismiss suggestion", note: "Hide the current ghost text. Typing also dismisses.", keys: ["esc"]),
-        .init(action: "Force suggestions here", note: "Turn completions on in the current field, even where Shadowtype stays idle (terminals, code editors).", keys: ["⌃", "`"]),
+        .init(action: "Suggest here (and always hereafter)", note: "Turn completions on in the current app, even where Shadowtype stays idle (terminals, code editors). The first press sticks — Shadowtype remembers the app and stops staying idle in it.", keys: ["⌃", "`"]),
         .init(action: "Rewrite selection", note: "Rewrite the selected text on-device — improve, shorten, change tone, fix grammar, or summarize. Preview before keeping.", keys: rewriteKeys),
         .init(action: "Pause for current app", note: "Temporarily disable in the frontmost app.", keys: ["⌃", "⌥", "P"]),
     ] }
