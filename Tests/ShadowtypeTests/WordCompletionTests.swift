@@ -54,8 +54,8 @@ final class WordCompletionTests: XCTestCase {
 
     func testMenuBuildsFullWordsInProbabilityOrder() {
         let menu = WordCompletion.branchMenu(
-            candidates: [c("age", 0.5), c("es", 0.3), c("atory", 0.1)], stem: "mess")
-        XCTAssertEqual(menu, ["message", "messages", "messatory"])
+            candidates: [c("age", 0.5), c("ages", 0.3), c("enger", 0.1)], stem: "mess")
+        XCTAssertEqual(menu, ["message", "messages", "messenger"])
     }
 
     func testMenuCutsAtFirstWhitespaceOneWordOnly() {
@@ -72,7 +72,7 @@ final class WordCompletionTests: XCTestCase {
 
     func testMenuDedupesKeepingFirstOccurrence() {
         let menu = WordCompletion.branchMenu(
-            candidates: [c("s", 0.5), c("s", 0.2), c("ing", 0.3)], stem: "thin")
+            candidates: [c("gs", 0.5), c("gs", 0.2), c("king", 0.3)], stem: "thin")
         XCTAssertEqual(menu, ["things", "thinking"])
     }
 
@@ -83,8 +83,8 @@ final class WordCompletionTests: XCTestCase {
     }
 
     func testMenuKeepsTrailingPunctuationCompletions() {
-        // "tion," may be the grammatically right completion of "insti" — only whitespace cuts.
-        let menu = WordCompletion.branchMenu(candidates: [c("tion,", 0.4)], stem: "insti")
+        // "tion," may be the grammatically right completion of "institu" — only whitespace cuts.
+        let menu = WordCompletion.branchMenu(candidates: [c("tion,", 0.4)], stem: "institu")
         XCTAssertEqual(menu, ["institution,"])
     }
 
