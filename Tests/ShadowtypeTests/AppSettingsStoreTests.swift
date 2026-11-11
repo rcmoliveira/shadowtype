@@ -87,8 +87,10 @@ final class AppSettingsStoreTests: XCTestCase {
         }
         let reloaded = AppSettingsStore(storeURL: url)
         XCTAssertTrue(reloaded.resolve(\.suggestHere, forBundleId: "com.apple.Terminal", globalDefault: false))
-        // An .on suggestHere is a real override — it must not be pruned as a no-op row.
-        XCTAssertEqual(reloaded.configuredBundleIds(), ["com.apple.Terminal"])
+        // An .on suggestHere is a real override — it must not be pruned as a no-op row. Keys come back
+        // normalized to lowercase (init normalizes every key for LaunchServices case slips), so the
+        // configured-id list is lowercase even though the id was written as com.apple.Terminal.
+        XCTAssertEqual(reloaded.configuredBundleIds(), ["com.apple.terminal"])
     }
 
     // A file written by an older build has no suggestHere key; the tolerant decoder falls back to .auto
