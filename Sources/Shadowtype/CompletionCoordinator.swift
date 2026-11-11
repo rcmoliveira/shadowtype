@@ -33,6 +33,9 @@ final class CompletionCoordinator {
 
     private let engine: InferenceEngineProtocol
     private let overlay: OverlayRenderer
+    // "Auto-show word alternatives" numbered menu (FlowIn port). Shown when the engine's top-K
+    // branches arrive on a mid-word generation; hidden with the ghost it belongs to.
+    private let wordBranchHUD = WordBranchHUD()
     private let context: EditContextTracker
 
     // INTEGRATOR-NOTE: the coordinator needs the Injector + WordMeter to satisfy
@@ -623,7 +626,8 @@ final class CompletionCoordinator {
             if let apple {
                 do {
                     try apple.generate(prompt: applePrompt, maxTokens: budget, seqID: 2, params: params,
-                                       requiredPrefix: nil, onToken: collect, onSample: nil)
+                                       requiredPrefix: nil, onToken: collect, onSample: nil,
+                                       onWordBranches: nil)
                 } catch {
                     Diag.log("rewrite: apple ERROR \(error) — falling back to the local model")
                 }
@@ -635,7 +639,8 @@ final class CompletionCoordinator {
             if acc.isEmpty, self.engine.isLoaded, self.isCurrent(myGen) {
                 do {
                     try self.engine.generate(prompt: prompt, maxTokens: budget, seqID: 2, params: params,
-                                             requiredPrefix: nil, onToken: collect, onSample: nil)
+                                             requiredPrefix: nil, onToken: collect, onSample: nil,
+                                             onWordBranches: nil)
                 } catch {
                     Diag.log("rewrite: ERROR \(error)")
                 }
@@ -1085,6 +1090,13 @@ final class CompletionCoordinator {
                 DispatchQueue.main.async {
                     guard self.isCurrent(myGen) else { return }
                     self.generationSession.wordBranchMenu = menu.isEmpty ? nil : menu
+                    // No resolved caret → keep the menu in the session but don't paint at (0,0);
+                    // the ghost render path resolves the caret moments later anyway.
+                    if menu.isEmpty {
+                        self.wordBranchHUD.hide()
+                    } else if let caret = self.generationSession.caretRect {
+                        self.wordBranchHUD.show(menu: menu, at: caret)
+                    }
                     Diag.log("gen: word menu rows=\(menu.count) top=\(menu.prefix(3))")
                 }
             } : nil
@@ -1845,6 +1857,10 @@ final class CompletionCoordinator {
         generationSession.prefixLanguage = nil
         generationSession.languageConstraints = []
         generationSession.focusSeq = nil
+        // The branch menu belongs to the ghost that just went away — a stale numbered list under a
+        // dead caret would be worse than no menu (its digits would still be swallowed by the tap).
+        generationSession.wordBranchMenu = nil
+        wordBranchHUD.hide()
     }
 
     // MARK: - Host font watch (FR-OV-4)
