@@ -297,6 +297,10 @@ final class CompletionCoordinator {
     // Two warms queued back-to-back add nothing (the second re-derives the first's KV) and push the
     // real fire() further behind, which is the opposite of the point.
     private var warmInFlight = false
+    // Monotonic id of the latest armed warm. The per-keystroke warm cancels+restarts constantly, so a
+    // superseded warm's completion can arrive AFTER a newer warm has already set warmInFlight=true —
+    // only the latest id may clear the flag, or it would drop a live warm's state. Main-thread only.
+    private var warmGeneration = 0
 
     private let generationSession = CompletionGenerationSession()
     // Memo for applyGlueGuard: renderSuggestion runs on every streamed token snapshot, but for a fixed
@@ -357,7 +361,7 @@ final class CompletionCoordinator {
         let work = DispatchWorkItem { [weak self] in self?.fire() }
         debounceWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
-        scheduleEagerWarm(delay: delay)
+        scheduleEagerWarm()
     }
 
     // Eager prefill (FlowIn's `eagerPrefillEnabled`): the debounce wait is dead inference time. The
@@ -372,19 +376,23 @@ final class CompletionCoordinator {
     // because warm KV survives appends (FR-CE-5).
     // If typing resumes, cancel() drops the pending warm and engine.requestCancel() stops a running
     // one between prefill chunks.
-    private func scheduleEagerWarm(delay: TimeInterval) {
-        // Sub-150 ms waits are a fast typist mid-burst: the warm would be cancelled almost at once
-        // and the GPU churn buys nothing (and heat feeds back into PowerPolicy's longer pauses).
-        guard delay >= 0.15 else { return }
-        // Same size-scaled prefill estimate the first-token deadline uses, so the two agree about how
-        // long a prefill takes. Sized from the LAST fired prefix (generationSession.activePrefix),
-        // not a fresh AX read: an AX value read is an IPC round-trip and this runs per keystroke.
-        // One keystroke of staleness is harmless — it only shifts a start time by tens of ms.
-        let lead = Self.generationDeadline(promptBytes: generationSession.activePrefix.utf8.count)
-        let startAt = max(0, delay - lead)
+    private func scheduleEagerWarm() {
+        // Per-keystroke warm (the FlowIn-like model): the warm tracks TYPING, not the pause. Each
+        // keystroke cancels the prior warm (the engine's defer commits its partial KV) and starts a fresh
+        // one that reuses that KV and prefills only the appended tokens (~65 ms). By the time the user
+        // pauses, the prompt is already (nearly) fully prefilled, so fire() rides warm KV and the first
+        // token is immediate. This is what makes it feel instant rather than "pause, then wait."
+        // Start IMMEDIATELY (next main-queue turn), not at `delay - prefill`: with incremental reuse the
+        // warm does not need to finish before fire() — fire() rides whatever KV is committed — so starting
+        // as early as possible strictly dominates. The old `delay - prefill` scheduling assumed a single
+        // warm that had to land before fire(); per-keystroke warming makes that assumption obsolete.
+        // No delay floor: the adaptive floor is ~120 ms, so a `delay >= 0.15` guard would skip the warm
+        // for exactly the fast/average typists who get the floor. The guards in eagerWarm() (secure field,
+        // terminal, OCR pending, meaningful boundary, ends-complete-statement, useful context) already
+        // prevent wasteful warming, and at most one warm ever runs (warmInFlight).
         let warmWork = DispatchWorkItem { [weak self] in self?.eagerWarm() }
         eagerWarmWork = warmWork
-        DispatchQueue.main.asyncAfter(deadline: .now() + startAt, execute: warmWork)
+        DispatchQueue.main.async(execute: warmWork)
     }
 
     // The warm itself. Same guards as warmFocus() minus its focus-scoped bookkeeping (OCR cache reset,
@@ -487,6 +495,11 @@ final class CompletionCoordinator {
         eagerWarmWork?.cancel()
         eagerWarmWork = nil
         bumpGeneration()           // supersede any in-flight closure
+        // Invalidate the in-flight warm's completion (so its late return can't clear a newer warm's flag)
+        // and release the flag so the NEXT keystroke's warm can proceed. requestCancel() below stops the
+        // running warm between chunks; the engine's defer commits whatever prefill it got through.
+        warmGeneration &+= 1
+        warmInFlight = false
         engine.requestCancel()     // cooperative stop between chunks/tokens
         contextAssembler.refireCount = 0     // a new keystroke/focus/force re-arms the one context-upgrade re-fire
         contextAssembler.fireDeferred = false // the deferred fire belonged to the superseded generation
@@ -1447,13 +1460,19 @@ final class CompletionCoordinator {
         // Main-thread bookkeeping before the hop: callers (focus warm, eager warm) read this to avoid
         // stacking a second warm behind the first on the serial queue.
         warmInFlight = true
+        let warmGen = warmGeneration &+ 1
+        warmGeneration = warmGen
         inferenceQueue.async { [weak self] in
             guard let self else { return }
             _ = myGen
             // One token is enough to force the full prefill into the KV cache; we stop immediately and
             // never display warm-up output (side effect = warm ctx).
             try? self.engine.generate(prompt: warmPrompt, maxTokens: 1) { _ in false }
-            DispatchQueue.main.async { self.warmInFlight = false }
+            DispatchQueue.main.async {
+                // Only the LATEST warm clears the flag: a superseded warm's late completion (the
+                // per-keystroke cancel+restart makes this common) must not drop a newer warm's state.
+                if self.warmGeneration == warmGen { self.warmInFlight = false }
+            }
         }
     }
 
