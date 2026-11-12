@@ -877,8 +877,11 @@ private struct ContextPane: View {
     private let permissionTick = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     private var effectiveScreenOCR: Binding<Bool> {
+        // The user's INTENT, not intent-AND-permission: web apps read the page via Accessibility (no
+        // Screen Recording needed), so the toggle must be operable even when Screen Recording is off.
+        // Gating it on the permission made web-only users unable to enable a feature that works for them.
         Binding(
-            get: { useScreenOCR && screenRecordingGranted },
+            get: { useScreenOCR },
             set: { useScreenOCR = $0 }
         )
     }
@@ -893,11 +896,11 @@ private struct ContextPane: View {
                 caption("The window of text you’re currently typing. Always used — it’s how completion works.")
 
                 Toggle("Use screen text for context", isOn: effectiveScreenOCR)
-                    .disabled(!screenRecordingGranted)
                 caption("Reads what's on screen so suggestions fit the surrounding text — e.g. the email thread you're replying to. In web apps (Gmail, etc.) it reads the page directly via Accessibility (exact, instant, no extra permission); elsewhere it falls back to on-device OCR (needs Screen Recording — see Permissions). Everything stays on your Mac, never stored or sent. Off by default; nothing is captured while off.")
                 if useScreenOCR && !screenRecordingGranted {
                     HStack {
-                        Label("Screen Recording required", systemImage: "exclamationmark.triangle.fill")
+                        Label("Web apps still work via Accessibility. Other apps need Screen Recording for OCR.",
+                              systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.orange)
                         Spacer()
