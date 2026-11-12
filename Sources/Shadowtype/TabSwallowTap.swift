@@ -13,6 +13,14 @@ final class TabSwallowTap {
     var onAccept: (() -> Void)?
     // ⌥Tab accepts the whole remaining line; bare Tab accepts the next word (FR-IN-5).
     var onAcceptLine: (() -> Void)?
+    // "Auto-show word alternatives": a swallowed menu digit arrives here (1-based row).
+    var onAcceptBranch: ((Int) -> Void)?
+
+    private enum Acceptance {
+        case word
+        case line
+        case branch(Int)
+    }
 
     // Accept keycodes (configurable). Default: Tab (kVK_Tab == 48).
     var acceptKeycodes: Set<Int64> {
@@ -27,11 +35,6 @@ final class TabSwallowTap {
             _acceptKeycodes = newValue
             os_unfair_lock_unlock(&_lock)
         }
-    }
-
-    private enum Acceptance {
-        case word
-        case line
     }
 
     private var _lock = os_unfair_lock_s()
@@ -58,6 +61,8 @@ final class TabSwallowTap {
     // suggestion render / accept-advance. Without this gate Right Arrow would swallow mid-line
     // cursor motion when the user had mid-line completions on. Pushed false on every clear.
     private var _caretAtLineEnd = false
+    // Visible word-alternatives menu row count (see setWordMenuRows). 0 = no menu, digits pass.
+    private var _wordMenuRows = 0
     // Set on the tap thread before the event is swallowed and cleared only after the main-queue
     // acceptance finishes. A key-repeat arriving while main is busy is swallowed but cannot enqueue
     // a second acceptance against the same visible suggestion.
@@ -145,6 +150,33 @@ final class TabSwallowTap {
         os_unfair_lock_unlock(&_lock)
     }
 
+    // Row count of the visible "auto show word alternatives" menu (0 = hidden). The coordinator
+    // pushes it whenever the menu changes (generation result, clearSuggestion); the tap reads it
+    // atomically at keyDown to decide whether a digit names a VISIBLE row.
+    func setWordMenuRows(_ n: Int) {
+        os_unfair_lock_lock(&_lock)
+        _wordMenuRows = n
+        os_unfair_lock_unlock(&_lock)
+    }
+
+    // Digit acceptance for the word-alternatives menu (FlowIn's interaction): ANSI digits 1–5 map
+    // to rows 1–5, and a digit is swallowed ONLY while the menu shows at least that many rows —
+    // out-of-range digits are ordinary number typing and always pass through (the tap-side
+    // expression of WordCompletion.select's guard). Modifiers always pass through.
+    static func digitForKeycode(_ keycode: Int64, menuRows: Int, hasModifier: Bool) -> Int? {
+        guard !hasModifier, menuRows > 0 else { return nil }
+        let digit: Int
+        switch keycode {
+        case 18: digit = 1          // kVK_ANSI_1
+        case 19: digit = 2          // kVK_ANSI_2
+        case 20: digit = 3          // kVK_ANSI_3
+        case 21: digit = 4          // kVK_ANSI_4
+        case 23: digit = 5          // kVK_ANSI_5
+        default: return nil
+        }
+        return digit <= menuRows ? digit : nil
+    }
+
     // Pure decision (testable). Swallow Right Arrow only when the ghost is visible AND the caret is
     // at end-of-line AND the user has the toggle on AND no modifier keys are held. Any modifier
     // (⇧→ extends selection, ⌥→ word-jump, ⌘→ line-jump) MUST pass through — those are the cases
@@ -184,6 +216,9 @@ final class TabSwallowTap {
             acceptance = flags.contains(.maskAlternate) ? .line : .word
         } else if isRightArrowAccept {
             acceptance = _rightArrowAcceptsAll ? .line : .word
+        } else if let digit = Self.digitForKeycode(keycode, menuRows: _wordMenuRows,
+                                                   hasModifier: hasModifier) {
+            acceptance = .branch(digit)
         } else {
             acceptance = nil
         }
@@ -209,6 +244,8 @@ final class TabSwallowTap {
                 self.onAccept?()
             case .line:
                 self.onAcceptLine?()
+            case let .branch(digit):
+                self.onAcceptBranch?(digit)
             }
         }
         return true

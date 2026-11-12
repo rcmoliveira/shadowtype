@@ -33,6 +33,9 @@ final class CompletionCoordinator {
 
     private let engine: InferenceEngineProtocol
     private let overlay: OverlayRenderer
+    // "Auto-show word alternatives" numbered menu (FlowIn port). Shown when the engine's top-K
+    // branches arrive on a mid-word generation; hidden with the ghost it belongs to.
+    private let wordBranchHUD = WordBranchHUD()
     private let context: EditContextTracker
 
     // INTEGRATOR-NOTE: the coordinator needs the Injector + WordMeter to satisfy
@@ -195,6 +198,9 @@ final class CompletionCoordinator {
     // TabSwallowTap.setSuggestionVisible(_:) so Tab is only swallowed while a ghost is
     // shown (the tap reads this atomically on its own thread — see TabSwallowTap).
     var onSuggestionVisibleChanged: ((Bool) -> Void)?
+    // Row count of the visible word-alternatives menu → AppDelegate → TabSwallowTap.setWordMenuRows,
+    // so the tap swallows digits only while rows are actually on screen.
+    var onWordMenuRowsChanged: ((Int) -> Void)?
 
     // Snapshot of caretAtLineEnd pushed at every ghost show + accept-advance so the
     // TabSwallowTap can gate Right Arrow accepts without a sync AX call from the tap thread.
@@ -205,7 +211,25 @@ final class CompletionCoordinator {
     // Settings-adjustable (General → "Suggestion trigger delay"). AppDelegate.syncToggles mirrors the
     // @AppStorage value here on launch + every change; clamped to the slider's 40–400 ms range there.
     var debounce: TimeInterval = 0.120                // ~120 ms idle before triggering — the adaptive FLOOR
-    private let deadline: TimeInterval = 0.400        // drop silently if no first token by here
+    // (The FR-CE-7 first-token deadline lives in `generationDeadline(promptBytes:)` below — it used to
+    //  be a flat `private let deadline: TimeInterval = 0.400`, now the base of the size-scaled value.)
+
+    // FR-CE-7 deadline, scaled by the work this fire actually has to do. The flat 400 ms assumed the
+    // warm KV-reuse path (~65 ms prefill of appended tokens). It holds there and stays byte-identical:
+    // prompts up to 1500 bytes keep exactly 400 ms. But the FIRST fire after a focus change, after an
+    // idle reload, or after KV divergence pays a full cold prefill — and at the 2048-token context
+    // default a long email thread (~7 KB prompt) cold-prefills in ~0.5-0.9 s on M3/M4-class Macs,
+    // so the flat deadline dropped exactly those ghosts (the engine's own comment: "the deadline-drop
+    // hides the cold-prefill cost"). Extending only when the first token is genuinely late is safe:
+    // newest-wins already supersedes the run the moment the user types again, so a slow-but-arriving
+    // ghost lands only while the user is still paused — where it is useful, not a surprise.
+    // +100 ms per 1.5 KB beyond 1.5 KB, capped at 800 ms total: prefill slower than ~18 tok/100 ms
+    // at the full budget (older Airs) still drops, as before.
+    static func generationDeadline(promptBytes: Int) -> TimeInterval {
+        let base: TimeInterval = 0.400
+        let extra = Double(max(0, promptBytes - 1500)) / 15_000.0
+        return min(base + extra, 0.8)
+    }
 
     // Adaptive typing-pause trigger (research: waiting for a *natural* pause raises acceptance and
     // near-eliminates sub-0.3 s "blind rejections" vs a fixed delay — arXiv 2511.18842). The fixed
@@ -215,10 +239,13 @@ final class CompletionCoordinator {
     // AppDelegate mirrors `pauseMultiplier` from the Aggressiveness setting; both default to "balanced".
     var adaptivePause = true
     var pauseMultiplier: Double = 2.3
-    // Hard cap on the wait. In practice this only binds for slow/hunt-peck typists (large median IKI),
-    // for whom a longer wait is exactly right — a fast typist's median×multiplier stays well under it.
-    // Set above a deliberate "thinking pause" (~0.6–1.0 s) so we still fire on genuine pauses.
-    private let adaptivePauseCeiling: TimeInterval = 1.0
+    // Hard cap on the wait. In practice this only binds for slow/hunt-peck typists (large median IKI).
+    // Was 1.0 s — the single most visible "slow to react" number: a 400 ms-cadence typist waited
+    // 920 ms before generation even started, then paid the prefill on top. 0.6 s still sits at the top
+    // of the deliberate "thinking pause" band the research uses. Modelled end-to-end (pause + prefill +
+    // first token), ceiling + the eager warm together take the ghost from 1.66 s to 0.91 s at a 400 ms
+    // cadence (-45%) and from 0.90 s to 0.74 s for a fast typist (-18%).
+    private let adaptivePauseCeiling: TimeInterval = 0.6
     // Monotonic timestamp of the previous keystroke and a small ring of recent inter-keystroke intervals
     // (session-break gaps excluded) used to estimate the user's natural cadence. Main-thread only.
     private var lastKeystrokeUptime: TimeInterval = 0
@@ -262,6 +289,18 @@ final class CompletionCoordinator {
 
     // MARK: - State (all mutated on main unless noted)
     private var debounceWork: DispatchWorkItem?
+    // The speculative KV warm armed mid-debounce (eager prefill). Cancelled with the debounce work so a
+    // keystroke that arrives before it starts costs nothing; a warm already running stops via requestCancel.
+    private var eagerWarmWork: DispatchWorkItem?
+    // True while a warmAssembledPrompt is queued/running on the serial inference queue. Set on main
+    // before dispatch, cleared back on main when the generate returns — main-only, so no locking.
+    // Two warms queued back-to-back add nothing (the second re-derives the first's KV) and push the
+    // real fire() further behind, which is the opposite of the point.
+    private var warmInFlight = false
+    // Monotonic id of the latest armed warm. The per-keystroke warm cancels+restarts constantly, so a
+    // superseded warm's completion can arrive AFTER a newer warm has already set warmInFlight=true —
+    // only the latest id may clear the flag, or it would drop a live warm's state. Main-thread only.
+    private var warmGeneration = 0
 
     private let generationSession = CompletionGenerationSession()
     // Memo for applyGlueGuard: renderSuggestion runs on every streamed token snapshot, but for a fixed
@@ -318,9 +357,70 @@ final class CompletionCoordinator {
         cancel()
         guard isEnabled, engine.isLoaded, !rewriteActive else { return }
 
+        let delay = adaptiveDelay(at: uptime)
         let work = DispatchWorkItem { [weak self] in self?.fire() }
         debounceWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + adaptiveDelay(at: uptime), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        scheduleEagerWarm()
+    }
+
+    // Eager prefill (FlowIn's `eagerPrefillEnabled`): the debounce wait is dead inference time. The
+    // prefix stops changing the moment the user pauses, yet the cold prefill only started at fire().
+    // The point is to overlap the two instead of serializing them.
+    // TIMING IS THE WHOLE GAME. A cold prefill runs 400–800 ms while the adaptive pause is only
+    // 161–600 ms, so a warm started at the midpoint NEVER finishes before fire() — it would save
+    // half the wait, not the prefill. So the lead is the prefill estimate itself: start at
+    // `delay - prefill`, which for every real pause is t≈0, i.e. warm on the keystroke. When the
+    // prefill still can't finish in time, the partial KV is retained anyway and fire() then pays only
+    // the appended tokens (~65 ms) — a warm is never "dead work" the way a cancelled generation is,
+    // because warm KV survives appends (FR-CE-5).
+    // If typing resumes, cancel() drops the pending warm and engine.requestCancel() stops a running
+    // one between prefill chunks.
+    private func scheduleEagerWarm() {
+        // Per-keystroke warm (the FlowIn-like model): the warm tracks TYPING, not the pause. Each
+        // keystroke cancels the prior warm (the engine's defer commits its partial KV) and starts a fresh
+        // one that reuses that KV and prefills only the appended tokens (~65 ms). By the time the user
+        // pauses, the prompt is already (nearly) fully prefilled, so fire() rides warm KV and the first
+        // token is immediate. This is what makes it feel instant rather than "pause, then wait."
+        // Start IMMEDIATELY (next main-queue turn), not at `delay - prefill`: with incremental reuse the
+        // warm does not need to finish before fire() — fire() rides whatever KV is committed — so starting
+        // as early as possible strictly dominates. The old `delay - prefill` scheduling assumed a single
+        // warm that had to land before fire(); per-keystroke warming makes that assumption obsolete.
+        // No delay floor: the adaptive floor is ~120 ms, so a `delay >= 0.15` guard would skip the warm
+        // for exactly the fast/average typists who get the floor. The guards in eagerWarm() (secure field,
+        // terminal, OCR pending, meaningful boundary, ends-complete-statement, useful context) already
+        // prevent wasteful warming, and at most one warm ever runs (warmInFlight).
+        let warmWork = DispatchWorkItem { [weak self] in self?.eagerWarm() }
+        eagerWarmWork = warmWork
+        DispatchQueue.main.async(execute: warmWork)
+    }
+
+    // The warm itself. Same guards as warmFocus() minus its focus-scoped bookkeeping (OCR cache reset,
+    // style snapshot), which belong to a focus change, not a pause.
+    private func eagerWarm() {
+        eagerWarmWork = nil
+        guard isEnabled, engine.isLoaded, !rewriteActive else { return }
+        // Pile-up guard: warms queue on the serial inference queue, so a second one behind a first
+        // adds nothing but latency for the real fire() that follows.
+        guard !warmInFlight else { return }
+        guard !context.isSecureField() else { return }
+        if let appRules, !appRules.isEnabled(bundleId: context.frontmostBundleId,
+                                             domain: context.frontmostDomainHost()) { return }
+        // The shell prompt is assembled differently (assembleShellPrompt) — warming the prose prompt
+        // in a terminal diverges at token 0 and the whole warm is discarded (#11).
+        guard !ActivationPolicy.isTerminal(bundleId: context.frontmostBundleId) else { return }
+        // OCR capture still in flight: fire() will prepend a `Context:` block this warm can't know
+        // about — the exact divergence the focus warm defers for (#11).
+        if useScreenOCR, contextAssembler.captureState == .pending { return }
+        guard let prefix = context.currentPrefix(), !prefix.isEmpty,
+              CompletionActivationEvaluator.hasUsefulContext(prefix, minPrefixChars: minPrefixChars) else { return }
+        // Skip the fires that are a guaranteed .skip anyway — a speculative prefill for them is pure
+        // wasted GPU. These are the two cheapest pure gates from the real decision chain (the evaluator
+        // runs them on the same prefix); the stateful ones (typo, non-prose, daily cap) stay in fire().
+        guard CompletionActivationEvaluator.isMeaningfulBoundary(prefix),
+              !CompletionActivationEvaluator.endsCompleteStatement(prefix) else { return }
+        Diag.log("warm: eager prefill during debounce")
+        warmAssembledPrompt(prefix: prefix, postCaret: context.suffixAfterCaret())
     }
 
     // The idle wait before firing, adapted to the user's typing cadence (FR-KC-5; research 2511.18842).
@@ -348,7 +448,15 @@ final class CompletionCoordinator {
         // Until we've seen a few intervals, behave exactly like the old fixed debounce.
         guard recentIKIs.count >= 3 else { return floor }
         let target = Self.median(recentIKIs) * pauseMultiplier
-        return min(adaptivePauseCeiling, max(floor, target))
+        let delay = min(adaptivePauseCeiling, max(floor, target))
+        // "Auto-show word alternatives" is a fire-WHILE-typing interaction (FlowIn's branch menu
+        // tracks the word, it does not wait for a sentence pause): with it on for the focused app,
+        // clamp the adaptive pause back to the debounce floor so the menu keeps up with typing.
+        if appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId,
+                               globalDefault: false) {
+            return floor
+        }
+        return delay
     }
 
     private static func median(_ xs: [TimeInterval]) -> TimeInterval {
@@ -358,21 +466,40 @@ final class CompletionCoordinator {
         return s.count % 2 == 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid]
     }
 
-    // Force-activate (global hotkey / menu "Force suggestions here"): trigger a suggestion for the
-    // focused field NOW, bypassing the auto-idle gate for this one shot. Skips the debounce (the user
-    // explicitly asked); every other safety gate — secure field, per-app/domain disable, boundary,
-    // min-context, daily cap — still applies.
+    // Force-activate (global hotkey ⌃`): trigger a suggestion for the focused field NOW, bypassing the
+    // auto-idle gate — AND remember that decision for the app. The first press in an auto-idle app
+    // (terminal/editor) fires one suggestion AND writes AppSettingsStore.suggestHere = .on, so every
+    // later fire there proceeds automatically. This replaces the old menu-bar "Force suggestions here"
+    // escape hatch, which had to be re-clicked forever. Every safety gate — secure field, per-app/domain
+    // disable, boundary, min-context, daily cap — still applies; the debounce is skipped (explicit ask).
     func forceActivate() {
         guard isEnabled, engine.isLoaded, !rewriteActive else { return }   // don't supersede a live rewrite
+        // Teach the app before firing: the fire() below reads the sticky flag through the same path a
+        // later keystroke will use, so the very first force and every later one take identical routes.
+        // Scoped to the auto-idle classes (terminals/editors) — in Mail or Slack `isIdle` is already
+        // false, so writing the flag there would be a pure no-op that still costs a Settings row.
+        if let bundleId = context.frontmostBundleId,
+           ActivationPolicy.isManaged(bundleId: bundleId),
+           !appSettings.resolve(\.suggestHere, forBundleId: bundleId, globalDefault: false) {
+            appSettings.set(.on, \.suggestHere, forBundleId: bundleId)
+            Diag.log("force: taught suggestHere for \(bundleId)")
+        }
         cancel()                  // clear any pending/in-flight work + ghost first
-        fire(forced: true)        // bypass the auto-idle gate for this one explicit trigger
+        fire(forced: true)        // bypass the auto-idle gate for this explicit trigger
     }
 
     // Cancel in-flight generation + pending debounce, hide the ghost (FR-CE-4).
     func cancel() {
         debounceWork?.cancel()
         debounceWork = nil
+        eagerWarmWork?.cancel()
+        eagerWarmWork = nil
         bumpGeneration()           // supersede any in-flight closure
+        // Invalidate the in-flight warm's completion (so its late return can't clear a newer warm's flag)
+        // and release the flag so the NEXT keystroke's warm can proceed. requestCancel() below stops the
+        // running warm between chunks; the engine's defer commits whatever prefill it got through.
+        warmGeneration &+= 1
+        warmInFlight = false
         engine.requestCancel()     // cooperative stop between chunks/tokens
         contextAssembler.refireCount = 0     // a new keystroke/focus/force re-arms the one context-upgrade re-fire
         contextAssembler.fireDeferred = false // the deferred fire belonged to the superseded generation
@@ -597,7 +724,8 @@ final class CompletionCoordinator {
             if let apple {
                 do {
                     try apple.generate(prompt: applePrompt, maxTokens: budget, seqID: 2, params: params,
-                                       requiredPrefix: nil, onToken: collect, onSample: nil)
+                                       requiredPrefix: nil, onToken: collect, onSample: nil,
+                                       onWordBranches: nil)
                 } catch {
                     Diag.log("rewrite: apple ERROR \(error) — falling back to the local model")
                 }
@@ -609,7 +737,8 @@ final class CompletionCoordinator {
             if acc.isEmpty, self.engine.isLoaded, self.isCurrent(myGen) {
                 do {
                     try self.engine.generate(prompt: prompt, maxTokens: budget, seqID: 2, params: params,
-                                             requiredPrefix: nil, onToken: collect, onSample: nil)
+                                             requiredPrefix: nil, onToken: collect, onSample: nil,
+                                             onWordBranches: nil)
                 } catch {
                     Diag.log("rewrite: ERROR \(error)")
                 }
@@ -680,14 +809,24 @@ final class CompletionCoordinator {
         let originalPrefix = snapshot?.prefix
         let rawPrefix = Self.prefixAfterEmailQuoteStrip(originalPrefix, host: host)
         let bundleId = context.frontmostBundleId
-        let managed = !forced && ActivationPolicy.isManaged(bundleId: bundleId)
+        // Sticky "suggest here": one ⌃` press in an auto-idle app teaches it permanently (AppSettingsStore
+        // .on), so the same app never needs forcing again. The menu-bar escape hatch is thereby obviated —
+        // the hotkey stays as the teaching gesture.
+        let taughtHere = appSettings.resolve(\.suggestHere, forBundleId: bundleId, globalDefault: false)
+        let managed = !(forced || taughtHere) && ActivationPolicy.isManaged(bundleId: bundleId)
         let heights = managed && ActivationPolicy.isEditor(bundleId: bundleId)
             ? context.focusedFieldAndWindowHeights() : nil
         let shellOptIn = managed && ActivationPolicy.isTerminal(bundleId: bundleId)
             && appSettings.resolve(\.shellCommands, forBundleId: bundleId, globalDefault: false)
+        // "Auto-show word alternatives" (FlowIn port): on for this app AND the caret sits mid-word.
+        // wordTrigger then bypasses the boundary gate (like emoji/snippet), and the mid-word Tier 2a
+        // heal in startGeneration is already the stem-constrained completion the menu needs.
+        // Same predicate the prompt builder uses (see isWordCompletionFire) — gate and prompt cannot
+        // disagree about which fire is a word fire.
+        let wordTrigger = isWordCompletionFire(prefix: rawPrefix, bundleId: bundleId)
         let prefixEvaluation = CompletionActivationEvaluator.evaluatePrefix(
             .init(
-                forced: forced,
+                forced: forced || taughtHere,
                 bundleId: bundleId,
                 terminalText: shellBuffer,
                 editorFieldHeight: heights?.field,
@@ -698,7 +837,8 @@ final class CompletionCoordinator {
                 focusSeq: context.focusChangeSequence,
                 emojiTrigger: rawPrefix.map(isEmojiTrigger) ?? false,
                 minPrefixChars: minPrefixChars,
-                snippetTrigger: rawPrefix.map { isSnippetTrigger($0, bundleId: bundleId) } ?? false
+                snippetTrigger: rawPrefix.map { isSnippetTrigger($0, bundleId: bundleId) } ?? false,
+                wordTrigger: wordTrigger
             ),
             capabilityGate: capabilityGate
         )
@@ -986,7 +1126,8 @@ final class CompletionCoordinator {
                 self.clearSuggestion()
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + deadline, execute: deadlineWork)
+        let scaledDeadline = Self.generationDeadline(promptBytes: prefix.utf8.count)
+        DispatchQueue.main.asyncAfter(deadline: .now() + scaledDeadline, execute: deadlineWork)
 
         // Tier 2a (mid-word healing): when the caret sits mid-word, back the prompt up to the last clean
         // word boundary and require the model to reproduce the typed stem before its output becomes the
@@ -998,6 +1139,7 @@ final class CompletionCoordinator {
         // head also keeps the KV anchor stable while typing within a word (fewer re-prefills).
         var promptPrefix = prefix
         var requiredPrefix: [UInt8]? = nil
+        var midWordStem: String? = nil   // bare stem for the word-branch menu (no leading WS)
         // Runtime kill-switch (default ON): healing fires on most completions (mid-word is the common
         // boundary), so this is the one-flip escape hatch if a beta surfaces a regression — no rebuild
         // (`defaults write com.shadowtype.app shadowtype.midWordHealing -bool NO`).
@@ -1007,8 +1149,10 @@ final class CompletionCoordinator {
             let trimmedWS = String(split.head.dropFirst(headTrimmed.count))
             promptPrefix = headTrimmed
             requiredPrefix = Array((trimmedWS + split.stem).utf8)
+            midWordStem = split.stem
         }
         generationSession.isHealed = (requiredPrefix != nil)
+        generationSession.wordBranchMenu = nil
 
         // FR-CTX-1/2/3, FR-PA-3: assemble enabled leading context, then the user's prefix as the
         // forward-from-caret tail. With context toggles off, effectivePrompt is the
@@ -1031,6 +1175,46 @@ final class CompletionCoordinator {
         // useEngineStopPolicy=false → raw stream, no prose word/sentence caps). Same seq 0 for KV continuity.
         let genParams: SamplingParams = shellMode ? .commandDefaults : .ghostDefaults
         let genMaxTokens = shellMode ? Self.shellMaxTokens : self.maxTokens
+        // "Auto-show word alternatives": on a mid-word (stem-constrained) generation, collect the
+        // engine's top-K continuations and build the numbered menu. Arrives on the inference thread
+        // at the first content token — the menu is ready as the ghost renders, FlowIn-style.
+        let wordAlternativesOn = !shellMode && requiredPrefix != nil && midWordStem != nil
+            && appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId,
+                                   globalDefault: false)
+        // Decision trail (issue: "alternatives list not displayed"): one line per generation,
+        // booleans only — which of the three gates is false is the whole diagnosis.
+        Diag.log("gen: wordAlt req=\(requiredPrefix != nil) stem=\(midWordStem ?? "nil") "
+               + "bundle=\(context.frontmostBundleId ?? "nil") "
+               + "resolve=\(appSettings.resolve(\.wordAlternatives, forBundleId: context.frontmostBundleId, globalDefault: false)) "
+               + "on=\(wordAlternativesOn)")
+        let onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? =
+            wordAlternativesOn ? { branches in
+                guard let stem = midWordStem else { return }
+                let menu = WordCompletion.branchMenu(
+                    candidates: branches.map { WordCompletion.Candidate(remainder: $0.remainder,
+                                                                        probability: $0.prob) },
+                    stem: stem)
+                DispatchQueue.main.async {
+                    guard self.isCurrent(myGen) else { return }
+                    self.generationSession.wordBranchMenu = menu.isEmpty ? nil : menu
+                    self.generationSession.wordBranchStem = menu.isEmpty ? nil : stem
+                    self.onWordMenuRowsChanged?(menu.count)
+                    // No resolved caret → keep the menu in the session but don't paint at (0,0);
+                    // the ghost render path resolves the caret moments later anyway (it re-shows
+                    // the HUD from the session menu — see render path).
+                    if menu.isEmpty {
+                        self.wordBranchHUD.hide()
+                        Diag.log("gen: word menu rows=0 (cleared)")
+                    } else if let caret = self.generationSession.caretRect, !caret.isNull {
+                        self.wordBranchHUD.show(menu: menu, at: caret)
+                        Diag.log("gen: word menu rows=\(menu.count) shown=\(self.wordBranchHUD.isVisible) "
+                               + "at=\(Int(caret.minX)),\(Int(caret.minY)) top=\(menu.prefix(3))")
+                    } else {
+                        // The real suspect for "menu not displayed": caret unresolved at callback time.
+                        Diag.log("gen: word menu rows=\(menu.count) caret=null — deferred to render")
+                    }
+                }
+            } : nil
 
         inferenceQueue.async { [weak self] in
             guard let self else { return }
@@ -1120,7 +1304,7 @@ final class CompletionCoordinator {
                         return !halt
                     }, onSample: { prob, isFirst in
                         gate.record(prob: Double(prob), isFirst: isFirst)
-                    })
+                    }, onWordBranches: onWordBranches)
                     if let key = preparedPrompt.cacheKey,
                        let budget = effectivePromptByteBudget {
                         self.storeTokenizerValidatedBudget(budget, for: key)
@@ -1273,12 +1457,22 @@ final class CompletionCoordinator {
     private func warmAssembledPrompt(prefix: String, postCaret: String?) {
         let myGen = bumpGeneration()
         let warmPrompt = assembledPrompt(prefix: prefix, postCaret: postCaret)
+        // Main-thread bookkeeping before the hop: callers (focus warm, eager warm) read this to avoid
+        // stacking a second warm behind the first on the serial queue.
+        warmInFlight = true
+        let warmGen = warmGeneration &+ 1
+        warmGeneration = warmGen
         inferenceQueue.async { [weak self] in
             guard let self else { return }
             _ = myGen
             // One token is enough to force the full prefill into the KV cache; we stop immediately and
             // never display warm-up output (side effect = warm ctx).
             try? self.engine.generate(prompt: warmPrompt, maxTokens: 1) { _ in false }
+            DispatchQueue.main.async {
+                // Only the LATEST warm clears the flag: a superseded warm's late completion (the
+                // per-keystroke cancel+restart makes this common) must not drop a newer warm's state.
+                if self.warmGeneration == warmGen { self.warmInFlight = false }
+            }
         }
     }
 
@@ -1423,6 +1617,28 @@ final class CompletionCoordinator {
         let n = WordMeter.wordCount(in: word)
         recordStyle(word)   // FR-CTX-3: learn from the accepted phrasing (gated inside).
         return n
+    }
+
+    // Digit acceptance for "auto show word alternatives" (FlowIn port): the tap swallowed digit N
+    // because the HUD showed ≥N rows; insert that row's word. The menu can only be as fresh as the
+    // last keystroke (every keystroke runs cancel→clearSuggestion, which drops the menu and pushes
+    // rows=0 to the tap), so `row.dropFirst(stem.count)` is exactly what the caret still needs.
+    func acceptWordBranch(_ digit: Int) -> Int {
+        guard let menu = generationSession.wordBranchMenu,
+              let row = WordCompletion.select(menu: menu, digit: digit) else { return 0 }
+        guard let target = acceptanceTarget() else { return 0 }
+        let stem = generationSession.wordBranchStem ?? ""
+        guard row.hasPrefix(stem) else { return 0 }
+        let toType = String(row.dropFirst(stem.count))
+        if toType.isEmpty { clearSuggestion(); return 0 }
+        guard inject(toType, into: target) else { return 0 }
+        countAcceptanceOnce()
+        wordMeter?.recordKeystrokesSaved(WordMeter.keystrokesSaved(accepting: toType))
+        bumpGeneration()
+        engine.requestCancel()
+        clearSuggestion()
+        recordStyle(toType)   // FR-CTX-3: learn from the accepted word
+        return WordMeter.wordCount(in: row)
     }
 
     // Inject the whole current line of the suggestion (up to the first newline).
@@ -1643,6 +1859,14 @@ final class CompletionCoordinator {
         let caret = caretOverride ?? generationSession.caretRect ?? (context.caretRectOnScreen() ?? .null)
         let caretDesc = caret.isNull ? "null" : "\(Int(caret.minX)),\(Int(caret.minY))"
         Diag.log("render: show len=\(display.count) caret=\(caretDesc)")
+        // The branch menu may have been computed before the caret resolved (callback logged
+        // "caret=null — deferred to render"). The ghost painting here proves a live caret; if a menu
+        // is pending and the HUD isn't up, paint it now at the same anchor the ghost uses.
+        if let menu = generationSession.wordBranchMenu, !menu.isEmpty,
+           !wordBranchHUD.isVisible, !caret.isNull {
+            wordBranchHUD.show(menu: menu, at: caret)
+            Diag.log("render: word hud re-shown rows=\(menu.count) shown=\(wordBranchHUD.isVisible)")
+        }
         Diag.logContent("render: show \"\(display.prefix(40))\"")
         // #2: hold the existing panel geometry across reconcile ticks (every streamed token, the
         // post-accept remainder re-render) unless something the user can see actually changed — focus
@@ -1788,6 +2012,12 @@ final class CompletionCoordinator {
         generationSession.prefixLanguage = nil
         generationSession.languageConstraints = []
         generationSession.focusSeq = nil
+        // The branch menu belongs to the ghost that just went away — a stale numbered list under a
+        // dead caret would be worse than no menu (its digits would still be swallowed by the tap).
+        generationSession.wordBranchMenu = nil
+        generationSession.wordBranchStem = nil
+        wordBranchHUD.hide()
+        onWordMenuRowsChanged?(0)
     }
 
     // MARK: - Host font watch (FR-OV-4)
@@ -2214,16 +2444,82 @@ final class CompletionCoordinator {
         contextAssembler.storeTokenizerValidatedBudget(budget, for: key)
     }
 
+    /// One predicate for "this fire is a mid-word word-completion fire", shared by the activation gate
+    /// and the prompt builder so they can never disagree (a gate that fires while the prompt builder
+    /// disagrees is the classic "no ghost and no reason" bug class).
+    /// Deliberately a PURE function of the prefix rather than a flag stashed on the session: the eager
+    /// warm builds its prompt before the real fire does, and both must derive the SAME answer from their
+    /// respective prefixes or the prompt head diverges and forces a full cold re-prefill (the #11 trap).
+    /// The stem predicate is monotone within a word (it stays true as the word grows), so warm and fire
+    /// agree across a burst.
+    /// NOTE the terminal term differs from the gate's `shellOptIn` by the `!(forced || taughtHere)`
+    /// clause: a force-taught terminal therefore keeps its full prompt. Acceptable and intentional —
+    /// terminals frame their own shell prompt (`assembleShellPrompt`) and are skipped by the warm anyway.
+    private func isWordCompletionFire(prefix: String?, bundleId: String?) -> Bool {
+        guard let prefix else { return false }
+        let shellOptIn = ActivationPolicy.isManaged(bundleId: bundleId)
+            && ActivationPolicy.isTerminal(bundleId: bundleId)
+            && appSettings.resolve(\.shellCommands, forBundleId: bundleId, globalDefault: false)
+        return appSettings.resolve(\.wordAlternatives, forBundleId: bundleId, globalDefault: false)
+            && !shellOptIn
+            && WordCompletion.stem(beforeCaret: prefix) != nil
+    }
+
+    /// Window kept for a mid-word word-completion prompt: from the strongest boundary NEAREST the caret
+    /// that still fits in `maxChars`, forward to the caret.
+    /// ANCHORING is the whole design, not slicing. A fixed-size *sliding* tail window moves its start one
+    /// character per keystroke, so the prompt head changes every keystroke and the engine cold-reprefills
+    /// every keystroke (measured: 3 distinct heads across 6 keystrokes) — the exact #11 trap this file
+    /// warns about. A sentence/line terminator, by contrast, does not move while the user types inside
+    /// the sentence, so the head is byte-stable across the burst and KV reuse holds (FR-CE-5). It also
+    /// keeps the *most relevant* context: the sentence being written, not an arbitrary 400 chars.
+    static func wordCompletionWindow(_ prefix: String, maxChars: Int) -> String {
+        guard prefix.count > maxChars else { return prefix }
+        let chars = Array(prefix)
+        let n = chars.count
+        let earliest = n - maxChars        // never reach further back than the window
+        var i = n - 1
+        while i > earliest {
+            let c = chars[i]
+            if c == "\n" { return String(chars[(i + 1)...]) }
+            // A terminator counts only when followed by whitespace, so decimals ("3.14"), ellipses and
+            // abbreviations ("e.g. x") do not masquerade as sentence ends.
+            if c == "." || c == "!" || c == "?" {
+                if i + 1 < n, chars[i + 1].isWhitespace { return String(chars[(i + 1)...]) }
+            }
+            i -= 1
+        }
+        // No boundary inside the window (one long run-on sentence): fall back to a word-aligned cut.
+        // This one DOES slide per keystroke — accepted, because it only happens past `maxChars` of
+        // unbroken prose, where the prompt is already small and a clean cut beats head stability.
+        let tail = String(chars[earliest...])
+        guard let firstSpace = tail.firstIndex(where: { $0.isWhitespace }) else { return tail }
+        return String(tail[tail.index(after: firstSpace)...])
+    }
+
+    // How much prose a mid-word word-completion prompt keeps, in characters (~100 tokens → prefill in
+    // the tens of ms, versus the 400–800 ms the full context assembly costs). This number IS the
+    // latency: prefill is linear in prompt bytes, and a word completion emits one or two tokens.
+    var wordPromptWindowChars = 400
+
     private func assembledPrompt(prefix: String, postCaret: String?, totalChars: Int? = nil) -> String {
+        // Mid-word word completion needs a SHORT prompt. Prefill cost is linear in prompt bytes, and the
+        // full assembly below (instruction + style + clipboard + OCR) costs 400–800 ms of it — which is
+        // the entire reason a mid-word ghost feels slow even though it only ever emits one or two tokens.
+        // What disambiguates a word completion is the sentence nearest the caret, not a screenful of
+        // sidebar, so a word fire drops the context blocks and keeps just that sentence.
+        let wordFire = isWordCompletionFire(prefix: prefix, bundleId: context.frontmostBundleId)
+        let promptPrefix = wordFire
+            ? Self.wordCompletionWindow(prefix, maxChars: wordPromptWindowChars) : prefix
         // Resolve each (already-gated-ready) source, then hand the gating + ordering + join to the pure
         // static below so it is unit-testable without AX/model/overlay (the leak-when-unlicensed property
         // is the security-critical invariant). Style hint is the focus-in snapshot (stable across the
         // burst); OCR is read from its warm cache.
-        let instruction = instructionStore?.effectiveInstruction(bundleId: context.frontmostBundleId)
+        let instruction = wordFire ? nil : instructionStore?.effectiveInstruction(bundleId: context.frontmostBundleId)
         let styleHint = contextAssembler.cachedStyleHint
-        let clip = clipboardContextEnabled
+        let clip = (!wordFire && clipboardContextEnabled)
             ? clipboard?.recentText(maxChars: clipboardContextChars) : nil
-        let ocrRaw = contextAssembler.cachedOCR
+        let ocrRaw = wordFire ? nil : contextAssembler.cachedOCR
         // Strip the user's own draft (and any ghost the OCR captured after it) from the screen text so
         // it isn't duplicated with the prefix below — the draft is only known here, on the prompt path.
         // De-dup the user's own document (already in `prefix`) from the screen text first, then strip
@@ -2263,11 +2559,11 @@ final class CompletionCoordinator {
         let ctxLang = (useScreenOCR && ocr != nil) ? contextAssembler.ocrLanguage : nil
 
         let assembled = Self.assemblePrompt(
-            prefix: prefix,
+            prefix: promptPrefix,
             instruction: instruction,
-            styleHint: styleHint, styleEnabled: styleProfileEnabled,
-            clipboard: clip, clipboardEnabled: clipboardContextEnabled,
-            ocr: ocr, ocrEnabled: useScreenOCR,
+            styleHint: styleHint, styleEnabled: !wordFire && styleProfileEnabled,
+            clipboard: clip, clipboardEnabled: !wordFire && clipboardContextEnabled,
+            ocr: ocr, ocrEnabled: !wordFire && useScreenOCR,
             postCaret: postCaret,
             steerLanguageName: ctxLang.flatMap(Self.englishLanguageName),
             totalChars: totalChars ?? promptCharBudget)
@@ -2331,12 +2627,14 @@ final class CompletionCoordinator {
     // engine's live token cap by AppDelegate.syncToggles, right next to where it sets
     // `engine.maxContextTokens` — THE TWO MUST STAY IN SYNC. They used to drift: this was hardcoded to
     // 6000 ("well inside the engine's 4096-token window"), but the window is the USER's
-    // `shadowtype.contextWindowTokens` setting, 1024 by default. InferenceEngine.generate() front-trims
+    // `shadowtype.contextWindowTokens` setting, 2048 by default. InferenceEngine.generate() front-trims
     // the tokenized prompt to that cap, and the FRONT is exactly where `Context:\n` + instruction +
     // style + clipboard + OCR live — so every context block we paid to build was decapitated and the
     // model got a headless fragment glued to `\n\nText:\n`, the flat-document shape the framing below
-    // exists to avoid. This default mirrors the 1024-token default of that key.
-    var promptCharBudget = CompletionCoordinator.promptBudgetBytes(forContextTokens: 1024)
+    // exists to avoid. This default mirrors the 2048-token default of that key (raised from 1024: the
+    // 3.5 KB prompt budget front-trimmed long drafts before the context blocks could matter; 2048
+    // doubles the recent-text window, matching how the strongest ghost-text competitors read the thread).
+    var promptCharBudget = CompletionCoordinator.promptBudgetBytes(forContextTokens: 2048)
 
     // Pure (testable): prompt bytes that safely fit `tokens` tokens. 3.5 bytes/token is deliberately
     // BELOW the ~4 bytes/token of mixed English prose: under-filling only wastes a little of the window,

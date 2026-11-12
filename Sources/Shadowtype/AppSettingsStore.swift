@@ -33,16 +33,28 @@ struct AppConfig: Codable, Equatable {
     // Default OFF (terminals stay quiet); the global default passed at resolve() is false. The
     // force-activate hotkey produces a command regardless of this toggle.
     var shellCommands: TriState
+    // "Auto-show word alternatives" (FlowIn port): while typing mid-word, fire early and attach a
+    // numbered list of word completions (type 1/2/3… to insert). Default OFF — opt-in interaction
+    // change; the global default passed at resolve() is false.
+    var wordAlternatives: TriState
+    // Sticky "force suggestions here": one ⌃` press in an auto-idle app (terminal/editor) flips this
+    // to .on for that app, so the auto-idle gate is bypassed on every later fire there — the user
+    // teaches the app once instead of forcing it forever. Replaces the menu-bar escape hatch.
+    // Default .auto → resolve(.auto, globalDefault: false) keeps the app auto-idle until taught.
+    var suggestHere: TriState
 
     init(midLine: TriState = .auto, autocorrect: TriState = .auto,
          disableTab: TriState = .auto, collectInputs: TriState = .auto,
-         rightArrowAccept: TriState = .auto, shellCommands: TriState = .auto) {
+         rightArrowAccept: TriState = .auto, shellCommands: TriState = .auto,
+         wordAlternatives: TriState = .auto, suggestHere: TriState = .auto) {
         self.midLine = midLine
         self.autocorrect = autocorrect
         self.disableTab = disableTab
         self.collectInputs = collectInputs
         self.rightArrowAccept = rightArrowAccept
         self.shellCommands = shellCommands
+        self.wordAlternatives = wordAlternatives
+        self.suggestHere = suggestHere
     }
 
     // Tolerant: a field absent from an older file falls back to .auto (the inert default).
@@ -54,6 +66,8 @@ struct AppConfig: Codable, Equatable {
         collectInputs    = try c.decodeIfPresent(TriState.self, forKey: .collectInputs) ?? .auto
         rightArrowAccept = try c.decodeIfPresent(TriState.self, forKey: .rightArrowAccept) ?? .auto
         shellCommands    = try c.decodeIfPresent(TriState.self, forKey: .shellCommands) ?? .auto
+        wordAlternatives = try c.decodeIfPresent(TriState.self, forKey: .wordAlternatives) ?? .auto
+        suggestHere      = try c.decodeIfPresent(TriState.self, forKey: .suggestHere) ?? .auto
     }
 
     /// An all-`.auto` config carries no overrides — used to prune empty entries so the store and the
@@ -61,6 +75,7 @@ struct AppConfig: Codable, Equatable {
     var isDefault: Bool {
         midLine == .auto && autocorrect == .auto && disableTab == .auto
             && collectInputs == .auto && rightArrowAccept == .auto && shellCommands == .auto
+            && wordAlternatives == .auto && suggestHere == .auto
     }
 }
 
@@ -103,7 +118,13 @@ final class AppSettingsStore {
         self.createDirectory = createDirectory
         self.atomicWrite = atomicWrite
         let loaded = AppSettingsStore.load(from: storeURL)
-        self.byBundle = loaded.apps
+        // Bundle ids are case-insensitive in LaunchServices (NSWorkspace yields com.apple.Notes while
+        // hand-edited or migrated files may carry com.apple.notes). Normalize at every boundary so a
+        // case slip can never silently drop a user's override — the miss is invisible to the Settings UI,
+        // which reads the same file it writes.
+        var normalized: [String: AppConfig] = [:]
+        for (key, value) in loaded.apps { normalized[key.lowercased()] = value }
+        self.byBundle = normalized
         self.canPersist = loaded.canPersist
     }
 
@@ -112,7 +133,7 @@ final class AppSettingsStore {
     func config(forBundleId bundleId: String?) -> AppConfig {
         guard let bundleId else { return AppConfig() }
         lock.lock(); defer { lock.unlock() }
-        return byBundle[bundleId] ?? AppConfig()
+        return byBundle[bundleId.lowercased()] ?? AppConfig()
     }
 
     /// Resolve one field for an app against its global default. Convenience over config()+TriState.resolve.
@@ -137,11 +158,12 @@ final class AppSettingsStore {
     ) -> Bool {
         guard !bundleId.isEmpty else { return false }
         lock.lock()
+        let key = bundleId.lowercased()   // case-insensitive keys — see init normalization note
         let previous = byBundle
-        var cfg = byBundle[bundleId] ?? AppConfig()
+        var cfg = byBundle[key] ?? AppConfig()
         cfg[keyPath: field] = value
-        if cfg.isDefault { byBundle[bundleId] = nil }   // drop no-op entries
-        else { byBundle[bundleId] = cfg }
+        if cfg.isDefault { byBundle[key] = nil }   // drop no-op entries
+        else { byBundle[key] = cfg }
         guard byBundle != previous else {
             lock.unlock()
             return true
@@ -163,7 +185,7 @@ final class AppSettingsStore {
     @discardableResult
     func clear(bundleId: String) -> Bool {
         lock.lock()
-        guard let previousConfig = byBundle.removeValue(forKey: bundleId) else {
+        guard let previousConfig = byBundle.removeValue(forKey: bundleId.lowercased()) else {
             lock.unlock()
             return true
         }

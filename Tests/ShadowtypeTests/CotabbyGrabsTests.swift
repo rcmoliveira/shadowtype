@@ -458,6 +458,7 @@ final class CotabbyGrabsTests: XCTestCase {
                       seqID: Int32, params: SamplingParams,
                       requiredPrefix: [UInt8]?,
                       onToken: (String) -> Bool,
-                      onSample: ((Float, Bool) -> Void)?) throws {}
+                      onSample: ((Float, Bool) -> Void)?,
+                      onWordBranches: (([(remainder: String, prob: Float)]) -> Void)? = nil) throws {}
     }
 }

@@ -2,6 +2,7 @@
 // Template SF Symbol icon + NSMenu: enable/disable, today's word count + cap,
 // current model, open settings, pause for current app, quit. LSUIElement set in main.swift.
 import Cocoa
+import Carbon.HIToolbox   // IsSecureEventInputEnabled() for the "why is it silent?" menu row
 
 // Menu actions are surfaced as NotificationCenter posts so AppDelegate can observe + wire
 // without StatusItemController reaching into other components.
@@ -48,10 +49,17 @@ final class StatusItemController: NSObject {
     private let enableItem  = NSMenuItem(title: "Enable Shadowtype", action: nil, keyEquivalent: "")
     private let wordsItem   = NSMenuItem(title: "Words today: 0", action: nil, keyEquivalent: "")
     private let modelItem   = NSMenuItem(title: "Model: —", action: nil, keyEquivalent: "")
+    // "Why is it silent?" row. IsSecureEventInputEnabled() is system-wide, so one other process
+    // (loginwindow after a lock, a password manager, a parked sudo) suppresses suggestions in EVERY
+    // app — the top cause of "it stopped working". Shown only while that is actually true, and it
+    // names the holder (SecureInputOwner) so the user has something to act on.
+    private let secureInputItem = NSMenuItem(title: "Paused: secure input active", action: nil, keyEquivalent: "")
     private let pauseItem   = NSMenuItem(title: "Pause for current app", action: nil, keyEquivalent: "")
     // "Disable for app ▸": its submenu is rebuilt live (NSMenuDelegate) from running visible apps.
     private let disableForAppItem = NSMenuItem(title: "Disable for app", action: nil, keyEquivalent: "")
-    private let forceItem   = NSMenuItem(title: "Force suggestions here", action: nil, keyEquivalent: "")
+    // Identity of the app submenu, so menuNeedsUpdate(_:) can tell it apart from the main menu (both
+    // delegate to self). Without this the main menu would be wiped and rebuilt as an app list.
+    private weak var appListSubmenu: NSMenu?
     // Auto-update: a persistent "Check for Updates…" item, plus an "Install Update…" item revealed only
     // once UpdateManager has a staged/available build.
     private let checkUpdatesItem  = NSMenuItem(title: "Check for Updates…", action: nil, keyEquivalent: "")
@@ -129,8 +137,14 @@ final class StatusItemController: NSObject {
         // Informational, non-clickable rows.
         wordsItem.isEnabled = false
         modelItem.isEnabled = false
+        secureInputItem.isEnabled = false
+        secureInputItem.isHidden = true
         menu.addItem(wordsItem)
         menu.addItem(modelItem)
+        menu.addItem(secureInputItem)
+        // Refreshed on every open (menuWillOpen): the secure-input state is transient and must never
+        // be cached — it flips the moment a lock/unlock or password-manager action ends.
+        menu.delegate = self
 
         menu.addItem(.separator())
 
@@ -169,13 +183,12 @@ final class StatusItemController: NSObject {
         let disableSub = NSMenu()
         disableSub.delegate = self
         disableForAppItem.submenu = disableSub
+        appListSubmenu = disableSub
         menu.addItem(disableForAppItem)
 
-        // Cotypist parity: a manual override for fields Shadowtype stays idle in by default (terminals,
-        // editor surfaces). Same effect as the ⌃` global hotkey, discoverable from the menu.
-        forceItem.target = self
-        forceItem.action = #selector(forceActivate)
-        menu.addItem(forceItem)
+        // The old "Force suggestions here" item is gone: ⌃` now TEACHES the app permanently (first press
+        // in an auto-idle app writes AppSettingsStore.suggestHere = .on), so a per-visit menu override
+        // no longer exists to offer. The .shadowtypeForceActivate notification stays for the hotkey path.
 
         menu.addItem(.separator())
 
@@ -314,10 +327,6 @@ final class StatusItemController: NSObject {
         NotificationCenter.default.post(name: .shadowtypePauseForApp, object: nil)
     }
 
-    @objc private func forceActivate() {
-        NotificationCenter.default.post(name: .shadowtypeForceActivate, object: nil)
-    }
-
     @objc private func quit() {
         NotificationCenter.default.post(name: .shadowtypeQuit, object: nil)
     }
@@ -341,10 +350,27 @@ final class StatusItemController: NSObject {
 // MARK: - "Disable for app ▸" live population
 
 extension StatusItemController: NSMenuDelegate {
+    // Main menu about to open: show why suggestions are suppressed, when they are. Secure input is a
+    // system-wide switch, so a lock screen, password manager or parked sudo silences every app —
+    // naming the holder turns "it stopped working" into something the user can act on.
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu !== appListSubmenu else { return }
+        if IsSecureEventInputEnabled() {
+            secureInputItem.title = "Paused — secure input held by \(SecureInputOwner.describe())"
+            secureInputItem.isHidden = false
+        } else {
+            secureInputItem.isHidden = true
+        }
+    }
+
     // Rebuild the submenu just before it opens: one row per running visible (.regular) app, checkmarked
     // when Shadowtype is currently disabled there. Reads AppRules.shared directly (same as the Settings
     // pane); the row posts a toggle that AppDelegate applies + persists.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        // The MAIN menu also delegates to self (for the secure-input row in menuWillOpen), and this
+        // method starts with removeAllItems() — running it against the main menu would delete the
+        // whole menu and replace it with app rows. Only the app submenu may be rebuilt here.
+        guard menu === appListSubmenu else { return }
         menu.removeAllItems()
         let ownBundleId = Bundle.main.bundleIdentifier
         let apps = NSWorkspace.shared.runningApplications

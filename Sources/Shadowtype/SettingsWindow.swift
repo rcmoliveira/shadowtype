@@ -873,12 +873,15 @@ private struct ContextPane: View {
     @AppStorage("clipboardContextEnabled") private var clipboardContext = false
     // Live: AppDelegate.syncToggles caps engine.maxContextTokens from this key AND derives the
     // coordinator's prompt byte budget from it, so this picker sizes the context blocks too.
-    @AppStorage("shadowtype.contextWindowTokens") private var contextTokens = 1024
+    @AppStorage("shadowtype.contextWindowTokens") private var contextTokens = 2048
     private let permissionTick = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     private var effectiveScreenOCR: Binding<Bool> {
+        // The user's INTENT, not intent-AND-permission: web apps read the page via Accessibility (no
+        // Screen Recording needed), so the toggle must be operable even when Screen Recording is off.
+        // Gating it on the permission made web-only users unable to enable a feature that works for them.
         Binding(
-            get: { useScreenOCR && screenRecordingGranted },
+            get: { useScreenOCR },
             set: { useScreenOCR = $0 }
         )
     }
@@ -893,11 +896,11 @@ private struct ContextPane: View {
                 caption("The window of text you’re currently typing. Always used — it’s how completion works.")
 
                 Toggle("Use screen text for context", isOn: effectiveScreenOCR)
-                    .disabled(!screenRecordingGranted)
                 caption("Reads what's on screen so suggestions fit the surrounding text — e.g. the email thread you're replying to. In web apps (Gmail, etc.) it reads the page directly via Accessibility (exact, instant, no extra permission); elsewhere it falls back to on-device OCR (needs Screen Recording — see Permissions). Everything stays on your Mac, never stored or sent. Off by default; nothing is captured while off.")
                 if useScreenOCR && !screenRecordingGranted {
                     HStack {
-                        Label("Screen Recording required", systemImage: "exclamationmark.triangle.fill")
+                        Label("Web apps still work via Accessibility. Other apps need Screen Recording for OCR.",
+                              systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.orange)
                         Spacer()
@@ -1126,10 +1129,22 @@ private struct AppsDomainsPane: View {
                            defaultOn: false,
                            state: model.configBinding(\.shellCommands, bundleId: key))
                 }
+                // Only meaningful where Shadowtype stays idle by default. Set automatically by the first
+                // ⌃` press in the app; exposed here so the teaching is visible and reversible.
+                if ActivationPolicy.isManaged(bundleId: key) {
+                    triRow("Suggest here",
+                           "You turned suggestions on in this app with ⌃`. It stays on for every field here after that. Set it back to Off to return this app to idle-by-default.",
+                           defaultOn: false,
+                           state: model.configBinding(\.suggestHere, bundleId: key))
+                }
                 triRow("Autocorrect",
                        "Offer a fix when the word you're typing looks like a typo.",
                        defaultOn: UserDefaults.standard.bool(forKey: "GW.autocorrectEnabled"),
                        state: model.configBinding(\.autocorrect, bundleId: key))
+                triRow("Auto-show word alternatives",
+                       "While typing a word, show a numbered list of completions; type 1, 2, 3… to insert one. Fires while typing, not on a pause.",
+                       defaultOn: false,
+                       state: model.configBinding(\.wordAlternatives, bundleId: key))
                 triRow("Disable Tab key",
                        "Stop Tab from accepting completions, for apps where Tab has native use.",
                        defaultOn: false,
@@ -1402,7 +1417,7 @@ private struct ShortcutsPane: View {
         .init(action: "Accept next word", note: "Take one word from the current suggestion. Right Arrow also works at end-of-line when enabled.", keys: ["Tab"]),
         .init(action: "Accept whole line", note: "Take the entire suggested line at once. Right Arrow can do this too — see below.", keys: ["⌥", "Tab"]),
         .init(action: "Dismiss suggestion", note: "Hide the current ghost text. Typing also dismisses.", keys: ["esc"]),
-        .init(action: "Force suggestions here", note: "Turn completions on in the current field, even where Shadowtype stays idle (terminals, code editors).", keys: ["⌃", "`"]),
+        .init(action: "Suggest here (and always hereafter)", note: "Turn completions on in the current app, even where Shadowtype stays idle (terminals, code editors). The first press sticks — Shadowtype remembers the app and stops staying idle in it.", keys: ["⌃", "`"]),
         .init(action: "Rewrite selection", note: "Rewrite the selected text on-device — improve, shorten, change tone, fix grammar, or summarize. Preview before keeping.", keys: rewriteKeys),
         .init(action: "Pause for current app", note: "Temporarily disable in the frontmost app.", keys: ["⌃", "⌥", "P"]),
     ] }

@@ -462,10 +462,11 @@ final class InferenceEngine: InferenceEngineProtocol {
                   seqID: Int32, params: SamplingParams,
                   requiredPrefix: [UInt8]?,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         try generate(prompt: prompt, maxTokens: maxTokens, seqID: seqID, params: params,
                      contextTokenCap: nil, requiredPrefix: requiredPrefix,
-                     onToken: onToken, onSample: onSample)
+                     onToken: onToken, onSample: onSample, onWordBranches: onWordBranches)
     }
     //
     // `contextTokenCap` overrides the engine-wide `maxContextTokens` for THIS call only. Ghost and
@@ -479,7 +480,8 @@ final class InferenceEngine: InferenceEngineProtocol {
                   contextTokenCap: Int?,
                   requiredPrefix: [UInt8]? = nil,
                   onToken: (String) -> Bool,
-                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)? = nil) throws {
+                  onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)? = nil,
+                  onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         guard isLoaded, let ctx, let vocab else { throw InferenceError.notLoaded }
         guard let cancellationRequest = cancellations.begin(seqID: seqID) else {
             throw InferenceError.cancelled
@@ -714,7 +716,8 @@ final class InferenceEngine: InferenceEngineProtocol {
                                 nVocab: nVocab, cand: &cand,
                                 requiredPrefix: requiredPrefix,
                                 cancellationRequest: cancellationRequest,
-                                onToken: onToken, onSample: onSample)
+                                onToken: onToken, onSample: onSample,
+                                onWordBranches: onWordBranches)
         } else {
             try apiDecodeLoop(ctx: ctx, vocab: vocab, smpl: smpl, batch: &batch,
                               seqID: seqID, maxTokens: maxTokens,
@@ -739,7 +742,8 @@ final class InferenceEngine: InferenceEngineProtocol {
                                  requiredPrefix: [UInt8]? = nil,
                                  cancellationRequest: CancellationRegistry.Request,
                                  onToken: (String) -> Bool,
-                                 onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?) throws {
+                                 onSample: ((_ prob: Float, _ isFirstContent: Bool) -> Void)?,
+                                 onWordBranches: ((_ branches: [(remainder: String, prob: Float)]) -> Void)? = nil) throws {
         // Tier 2a: bytes the model must still reproduce before its output becomes the ghost (mid-word
         // healing). While non-empty, the sampler is constrained to prefix-compatible tokens and the
         // consumed stem bytes are stripped from each emitted piece. Empty → behaviour is byte-identical
@@ -794,6 +798,13 @@ final class InferenceEngine: InferenceEngineProtocol {
                 hasSampleObserver: onSample != nil,
                 hasRequiredPrefix: !remaining.isEmpty
             )
+            // Word-branch menu: on the FIRST content token of a stem-constrained run (exactly the
+            // mid-word completion step), also capture the top-8 continuations while the sampler
+            // masks to stem-admissible tokens. `wantsBranches` is false on every other step and
+            // for every caller that doesn't pass the callback → byte-identical hot path.
+            let wantsBranches = onWordBranches != nil && !remaining.isEmpty && !sawNonSpace
+            var topK: [(token: llama_token, prob: Float)]? = wantsBranches ? [] : nil
+            let stemForBranches: [UInt8]? = wantsBranches ? remaining : nil   // full stem at this step
             let tok: llama_token
             let confProb: Float
             let alreadyAccepted: Bool
@@ -803,8 +814,9 @@ final class InferenceEngine: InferenceEngineProtocol {
                     smpl: smpl,
                     nVocab: nVocab,
                     cand: &cand,
-                    computeConfidence: onSample != nil,
-                    requiredRemaining: remaining[...]
+                    computeConfidence: onSample != nil || wantsBranches,
+                    requiredRemaining: remaining[...],
+                    outTopK: &topK
                 )
             } else {
                 tok = llama_sampler_sample(smpl, ctx, -1)
@@ -818,6 +830,27 @@ final class InferenceEngine: InferenceEngineProtocol {
                 return
             }
             if !alreadyAccepted { llama_sampler_accept(smpl, tok) }
+            if wantsBranches, let topK, let stemForBranches {
+                // Menu WITHOUT decoding (replaces the KV-rewind expansion, which corrupted the
+                // hybrid/SWA cache: seq_rm can return false on partial sliding-window tails —
+                // see the reuse-path Spike-5 comment — leaving positions occupied → the next
+                // llama_decode returns -1 and kills the main generation: decodeFailed(-1)).
+                // The raw top-K first tokens ARE the branch set: a token either re-emits the
+                // stem (mask-admissible, e.g. " message" → strip the stem bytes → "age") or is
+                // the post-stem continuation directly ("age", "ages", "y"). branchMenu prepends
+                // the stem, cuts to one word, dedupes ("age" from both routes), orders by prob.
+                let raw: [(remainder: String, prob: Float)] = topK.compactMap { t in
+                    let tb = tokenBytesSlice(t.token)
+                    let rest: ArraySlice<UInt8>
+                    if stemForBranches.starts(with: tb) { rest = [] }                      // inside stem
+                    else if tb.starts(with: stemForBranches) { rest = tb.dropFirst(stemForBranches.count) }
+                    else { rest = tb }                                                      // post-stem
+                    let s = String(decoding: rest, as: UTF8.self)
+                    return s.isEmpty ? nil : (remainder: s, prob: t.prob)
+                }
+                Diag.log("engine: word-branch topK raw=\(raw.count)")
+                onWordBranches?(raw)
+            }
             let hadContentBefore = sawNonSpace
 
             var pieceBytes = tokenToPieceBytes(tok, vocab: vocab)
@@ -1318,6 +1351,25 @@ final class InferenceEngine: InferenceEngineProtocol {
                                 computeConfidence: Bool,
                                 requiredRemaining: ArraySlice<UInt8> = [][...])
         -> (token: llama_token, confidence: Float, alreadyAccepted: Bool) {
+        var unusedTopK: [(token: llama_token, prob: Float)]? = nil
+        return sampleWithProb(ctx: ctx, smpl: smpl, nVocab: nVocab, cand: &cand,
+                              computeConfidence: computeConfidence,
+                              requiredRemaining: requiredRemaining, outTopK: &unusedTopK)
+    }
+
+    // `outTopK`, when non-nil on entry, receives the top-8 tokens by RAW probability after the
+    // sampler chain's stem mask (admissible-only — masked -inf tokens drop out of both max and
+    // sum, so a healed step reports the top-8 among the continuations the stem constraint left).
+    // This is the word-branch menu's raw material: captured from the very logits sweep the
+    // confidence math already runs, so the menu costs no extra forward pass.
+    private func sampleWithProb(ctx: OpaquePointer,
+                                smpl: UnsafeMutablePointer<llama_sampler>,
+                                nVocab: Int,
+                                cand: inout [llama_token_data],
+                                computeConfidence: Bool,
+                                requiredRemaining: ArraySlice<UInt8> = [][...],
+                                outTopK: inout [(token: llama_token, prob: Float)]?)
+        -> (token: llama_token, confidence: Float, alreadyAccepted: Bool) {
         guard nVocab > 0, let logits = llama_get_logits_ith(ctx, -1) else {
             return (llama_sampler_sample(smpl, ctx, -1), 0, true)
         }
@@ -1350,6 +1402,18 @@ final class InferenceEngine: InferenceEngineProtocol {
             }
         }
         let rawPeak: Float = computeConfidence && sumExp > 0 ? Float(1.0 / sumExp) : 0
+        if outTopK != nil, maxLogit > -.infinity, sumExp > 0 {
+            // Tokens >14 nats under the peak carry p/p_peak < 8.4e-7 — they cannot crack a top-8
+            // of a distribution whose survivors number in the low thousands, so the cutoff sweep
+            // touches the same token subset the sumExp loop above already visits.
+            let cutoff = maxLogit - 14
+            var top: [(token: llama_token, prob: Float)] = []
+            for i in 0..<nVocab where cand[i].logit > cutoff {
+                top.append((llama_token(i), Float(exp(cand[i].logit - maxLogit)) / Float(sumExp)))
+            }
+            top.sort { $0.prob > $1.prob }
+            outTopK = Array(top.prefix(8))
+        }
         return cand.withUnsafeMutableBufferPointer { buf -> (llama_token, Float, Bool) in
             var cur = llama_token_data_array(
                 data: buf.baseAddress, size: nVocab, selected: -1, sorted: false)
